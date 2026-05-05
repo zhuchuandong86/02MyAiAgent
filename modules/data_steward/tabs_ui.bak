@@ -1,0 +1,1055 @@
+import os
+import tempfile
+import pandas as pd
+import streamlit as st
+import gc
+import json  # 🔴 新增：用于将模板保存为本地文件
+import re  # 🔴 加上这一行：导入正则表达式模块
+
+from modules.data_steward.db_engine import (
+    execute_write, execute_safe_query, get_all_tables,
+    get_table_schema, get_table_count, clean_table_name,
+    peek_file_headers, get_db_connection, db_lock,
+    invalidate_schema_cache  # ★ 防白屏：写操作后主动清缓存
+)
+from modules.data_steward.ai_engine import call_ai_architect, call_ai_sql_coder, extract_sql,call_ai_architect_stream
+
+
+# ==========================================
+# 工具函数：过滤 AI 中间临时表 (保护业务大盘)
+# ==========================================
+def get_business_tables():
+    return [t for t in get_all_tables() if not t.startswith('ai_step_')]
+
+# 🔴 修改后：极速 CSV 转换引擎 (绕过不可哈希的数据，使用 SQL 作为唯一缓存键)
+# 🔴 极速 CSV 转换引擎 (绕过不可哈希的数据，使用 SQL 作为唯一缓存键)
+@st.cache_data(show_spinner=False, max_entries=10)
+def fast_df_to_csv(_df, query_key):
+    return _df.to_csv(index=False).encode('utf-8-sig')
+
+# ==========================================
+# 🔴 新增：极速原生全量 CSV 导出引擎 (绕过 Pandas 内存杀手，直接从底层 DuckDB 写盘)
+# ==========================================
+@st.cache_data(show_spinner=False, max_entries=5)
+def fast_table_to_csv_bytes(table_name, query_key):
+    import tempfile
+    tmp_fd, tmp_path = tempfile.mkstemp(suffix=".csv")
+    os.close(tmp_fd)
+    try:
+        conn = get_db_connection()
+        # 调用 DuckDB 原生 COPY 命令，直接将几十万行数据流式写入硬盘，0 内存消耗！
+        conn.execute(f"COPY (SELECT * FROM \"{table_name}\") TO '{tmp_path}' (HEADER)")
+        with open(tmp_path, "rb") as f:
+            return b'\xef\xbb\xbf' + f.read() # 加上 BOM 防止 Excel 乱码
+    except Exception as e:
+        return str(e).encode('utf-8')
+    finally:
+        if os.path.exists(tmp_path):
+            try:
+                os.remove(tmp_path)
+            except: pass
+
+# ==========================================
+# TAB 1: 数据入库引擎 (常驻双输入框 + 极速零内存)
+# ==========================================
+def render_etl_tab():
+    col_input, col_action = st.columns([1, 1], gap="large")
+    data_sources = [] 
+    
+    with col_input:
+        st.markdown("### 1. 接入数据源")
+        st.caption("💡 小提示：您可以同时使用拖拽和本地路径，系统会自动将所有文件纳入处理队列。")
+        
+        uploaded_files = st.file_uploader("📁 网页拖拽上传 (CSV/Excel)", accept_multiple_files=True, type=["csv", "xlsx", "xls"], key="etl_file_uploader")
+        
+        st.markdown("##### ➕ 或")
+        
+        path_input = st.text_input("🔗 本地绝对路径直连 (输入文件夹或文件路径)", placeholder="例如：D:\\data\\2025订单汇总", key="etl_path_input")
+        
+        # 收集拖拽文件
+        if uploaded_files:
+            for uf in uploaded_files:
+                tmp_path = os.path.join(tempfile.gettempdir(), uf.name)
+                with open(tmp_path, "wb") as f: f.write(uf.getbuffer())
+                data_sources.append(tmp_path)
+            st.success(f"✅ 成功缓存 {len(uploaded_files)} 个拖拽文件。")
+            
+        # 收集本地路径文件
+        folder_name = ""
+        if path_input and os.path.exists(clean_path := path_input.strip(' \'"\n\r\t')):
+            folder_name = clean_table_name(os.path.basename(clean_path))
+            if os.path.isdir(clean_path):
+                local_files = [os.path.join(r, f) for r, _, fs in os.walk(clean_path) for f in fs if f.lower().endswith(('.csv', '.xlsx', '.xls'))]
+                data_sources.extend(local_files)
+            else: 
+                data_sources.append(clean_path)
+            if data_sources:
+                st.success(f"✅ 成功扫描本地路径！提取到 {len(data_sources) - len(uploaded_files)} 个表格文件。")
+
+    with col_action:
+        st.markdown("### 2. 智能配置与入库")
+        if data_sources:
+            # 状态固化：避免 Schema 分组因 UI 刷新而重复计算导致卡顿
+            current_ds_hash = hash(tuple(data_sources))
+            if st.session_state.get('ds_hash') != current_ds_hash:
+                schema_map = {}
+                for f in data_sources:
+                    cols = peek_file_headers(f)
+                    schema_map.setdefault(cols, []).append(f)
+                st.session_state.schema_map_cache = schema_map
+                st.session_state.ds_hash = current_ds_hash
+            schema_map = st.session_state.schema_map_cache
+            
+            if st.button("🤖 AI 诊断合并策略", use_container_width=True, key="etl_ai_btn"):
+                with st.spinner("架构师比对中..."):
+                    summary = [f"分组 {i+1}:\n> 文件数: {len(files)} 个 (例如: {os.path.basename(files[0])})\n> 字段: `[{', '.join(str(c) for c in cols)}]`" for i, (cols, files) in enumerate(schema_map.items())]
+                    st.info(call_ai_architect(f"检测到 {len(schema_map)} 种不同结构的文件：\n{chr(10).join(summary)}\n请给出业务入库与表名建议，一句话说明这几个组分别代表什么业务。", "入库诊断"))
+
+            st.markdown("---")
+            st.info(f"💡 **智能分组**：根据表头将 {len(data_sources)} 个文件划分为 **{len(schema_map)}** 个业务组。")
+            
+            group_configs = []
+            for i, (cols, files) in enumerate(schema_map.items()):
+                with st.container(border=True):
+                    st.markdown(f"#### 📦 分组 {i+1} (包含 {len(files)} 个同构文件自动合并)")
+                    
+                    file_names = [os.path.basename(f) for f in files]
+                    with st.expander("👀 展开查看包含的文件及共有字段", expanded=False):
+                        st.caption(f"**自动合并的文件**：`{', '.join(file_names)}`")
+                        st.caption(f"**共有字段(表结构)**：`{', '.join(str(c) for c in cols)}`")
+                    
+                    if folder_name and len(files) > 1:
+                        default_tb_name = f"{folder_name}_{i+1}" if len(schema_map) > 1 else folder_name
+                    else:
+                        default_tb_name = clean_table_name(os.path.splitext(file_names[0])[0])
+                        if len(files) > 1: default_tb_name += "_merged"
+                        
+                    col_act, col_tb = st.columns([1, 1.5])
+                    with col_act:
+                        action = st.radio(f"组 {i+1} 策略", ["✨ 建新表", "➕ 追加", "🔄 覆盖"], key=f"act_{i}", horizontal=True)
+                    with col_tb:
+                        if action == "✨ 建新表":
+                            tb_name = st.text_input(f"指定表名 (组 {i+1})", value=default_tb_name, key=f"tb_{i}")
+                        else:
+                            all_tbs = get_business_tables()
+                            tb_name = st.selectbox(f"指定目标表 (组 {i+1})", all_tbs if all_tbs else [default_tb_name], key=f"tb_sel_{i}")
+                    
+                    group_configs.append({"files": files, "action": action, "target_table": tb_name})
+
+            if st.button("🚀 执行批量分组入库", type="primary", use_container_width=True, key="etl_exec_btn"):
+                if any(not conf["target_table"] for conf in group_configs):
+                    st.error("❌ 所有的分组都必须填写目标表名！")
+                    return
+                    
+                with st.status(f"🔄 正在执行多线程分组写入底层...", expanded=True) as status:
+                    total_rows = 0
+                    for grp_idx, conf in enumerate(group_configs):
+                        files = conf["files"]
+                        action = conf["action"]
+                        curr_table = conf["target_table"]
+                        
+                        st.write(f"--- 🚀 正在处理 **分组 {grp_idx+1}** -> 目标表：`{curr_table}` ---")
+                        
+                        
+                        for idx, source in enumerate(files):
+                            is_first_chunk = (idx == 0)
+                            st.write(f"装载: `{os.path.basename(source)}`...")
+                            
+                            count_before = 0
+                            try: count_before = execute_safe_query(f"SELECT COUNT(*) FROM {curr_table}").iloc[0,0]
+                            except Exception: pass
+
+                            try:
+                                if source.lower().endswith('.csv'):
+                                    try:
+                                        if action == "✨ 建新表" and is_first_chunk: 
+                                            execute_write(f"CREATE TABLE {curr_table} AS SELECT * FROM read_csv_auto('{source}')")
+                                        elif action == "🔄 覆盖" and is_first_chunk:
+                                            execute_write(f"DROP TABLE IF EXISTS {curr_table}")
+                                            execute_write(f"CREATE TABLE {curr_table} AS SELECT * FROM read_csv_auto('{source}')")
+                                        else: 
+                                            execute_write(f"INSERT INTO {curr_table} SELECT * FROM read_csv_auto('{source}')")
+                                    except Exception:
+                                        try: df_new = pd.read_csv(source, encoding='utf-8')
+                                        except UnicodeDecodeError: df_new = pd.read_csv(source, encoding='gbk')
+                                        
+                                        df_new.columns = [clean_table_name(str(c)) for c in df_new.columns]
+                                        conn = get_db_connection()
+                                        with db_lock:
+                                            conn.register('tmp_df', df_new)
+                                            if action == "✨ 建新表" and is_first_chunk: conn.execute(f"CREATE TABLE {curr_table} AS SELECT * FROM tmp_df")
+                                            elif action == "🔄 覆盖" and is_first_chunk:
+                                                conn.execute(f"DROP TABLE IF EXISTS {curr_table}")
+                                                conn.execute(f"CREATE TABLE {curr_table} AS SELECT * FROM tmp_df")
+                                            else: conn.execute(f"INSERT INTO {curr_table} SELECT * FROM tmp_df")
+                                            conn.unregister('tmp_df')
+                                        del df_new
+                                        gc.collect()
+                                else:
+                                    try: df_new = pd.read_excel(source, engine="calamine")
+                                    except: df_new = pd.read_excel(source)
+                                    df_new.columns = [clean_table_name(str(c)) for c in df_new.columns]
+                                    
+                                    conn = get_db_connection()
+                                    with db_lock:
+                                        conn.register('tmp_df', df_new)
+                                        if action == "✨ 建新表" and is_first_chunk: conn.execute(f"CREATE TABLE {curr_table} AS SELECT * FROM tmp_df")
+                                        elif action == "🔄 覆盖" and is_first_chunk:
+                                            conn.execute(f"DROP TABLE IF EXISTS {curr_table}")
+                                            conn.execute(f"CREATE TABLE {curr_table} AS SELECT * FROM tmp_df")
+                                        else: conn.execute(f"INSERT INTO {curr_table} SELECT * FROM tmp_df")
+                                        conn.unregister('tmp_df')
+                                    del df_new
+                                    gc.collect()
+                            except Exception as e: 
+                                st.error(f"❌ 失败: {e}")
+
+                            count_after = 0
+                            try: count_after = execute_safe_query(f"SELECT COUNT(*) FROM {curr_table}").iloc[0,0]
+                            except Exception: pass
+                            total_rows += max(0, count_after - count_before)
+                            
+                    invalidate_schema_cache()  # ★ 入库完成后清缓存，下拉框立即反映新表
+                    status.update(label=f"✅ 批量入库完美收官！本次共装载数据 {total_rows} 行。", state="complete")
+                    st.success("全部操作成功，请前往资产大盘查看生成的表。")
+
+
+# ==========================================
+# TAB 2: 数据资产大盘 (终极流式防超时版)
+# ==========================================
+def render_profile_tab():
+    st.markdown("### 🗂️ 数据资产大盘与智能体检")
+    tables = get_business_tables()
+    
+    # 🔴 插入这段“垃圾清理卫士”代码
+    all_raw_tables = get_all_tables()
+    garbage_tables = [t for t in all_raw_tables if t.startswith('ai_step_')]
+    if garbage_tables:
+        st.warning(f"🧹 系统扫描到硬盘中残留了 **{len(garbage_tables)}** 个历史 AI 中间表。")
+        if st.button("🗑️ 一键抹除中间表"):
+            with st.spinner("正在执行底层物理删除..."):
+                conn = get_db_connection()
+                with db_lock:
+                    for gt in garbage_tables:
+                        try:
+                            conn.execute(f"DROP TABLE IF EXISTS {gt}")
+                        except Exception: pass
+            invalidate_schema_cache()  # ★ 删表后清缓存
+            st.success("✅ 清理完毕！硬盘空间已释放。")
+            st.rerun()
+    # 🔴 清理代码结束
+
+    if not tables:
+        st.warning("📭 仓库为空，请先前往【接入数据源】装载数据。")
+        return
+
+    cache_file_path = os.path.join("global_data", "data_warehouse", "ai_profile_cache.md")
+    current_tables_hash = hash(tuple(sorted(tables)))
+
+    # ================= 1. AI 智能体检报告区 =================
+    st.markdown("#### 🤖 AI 智能体检报告")
+    
+    # 尝试加载缓存的报告
+    if not st.session_state.get("data_profile_cache") and os.path.exists(cache_file_path):
+        try:
+            with open(cache_file_path, "r", encoding="utf-8") as f:
+                content = f.read()
+                if content.startswith(f""):
+                    st.session_state.data_profile_cache = content.split("\n", 1)[1]
+        except Exception: pass
+
+    col_btn, _ = st.columns([3, 1])
+    with col_btn:
+        if st.button("🚀 AI 扫描全库：生成分表体检与综合评价", use_container_width=True, key="profile_ai_btn"):
+            with st.status("🕵️‍♂️ 启动全库深度扫描...", expanded=True) as status:
+                prompt_payload = ""
+                for i, t in enumerate(tables):
+                    st.write(f"⏳ 正在深度解剖表结构: `{t}` ({i+1}/{len(tables)})...")
+                    try:
+                        count = execute_safe_query(f"SELECT COUNT(*) FROM {t}").iloc[0,0]
+                        summary_df = execute_safe_query(f"SUMMARIZE {t}")
+                        prompt_payload += f"### 表: `{t}` (行数: {count})\n字段特征: "
+                        
+                        k_cols = []
+                        for _, row in summary_df.iterrows():
+                            c_name = row['column_name']
+                            u_cnt = row['approx_unique']
+                            null_pct = row.get('null_percentage', '0%')
+                            if pd.notna(u_cnt):
+                                k_cols.append(f"{c_name}(唯一:{int(u_cnt)}, 空值率:{null_pct})")
+                        prompt_payload += ", ".join(k_cols) + "\n\n"
+                    except Exception as e: 
+                        st.error(f"⚠️ 扫描表 `{t}` 时遇到问题: {e}")
+                
+                prompt_payload_trunc = prompt_payload[:8000] + "\n...(已截断)" if len(prompt_payload) > 8000 else prompt_payload
+                
+                status.update(label="🧠 底层特征提取完毕！开始实时流式生成报告...")
+                st.markdown("---")
+                st.markdown("##### 📝 正在逐字撰写架构师报告：")
+                
+                sys_prompt = (
+                    f"扫描以下数据库结构：\n{prompt_payload_trunc}\n"
+                    "请你作为首席数据架构师，给出深度评估报告，参考以下三个部分：\n"
+                    "1. 【各表体检报告】：逐一列出每张表的名字，并点评其数据质量（重点指出异常的空值率或字段分布特点）。\n"
+                    "2. 【综合资产评价】：总结整体数据仓库的健康度。\n"
+                    "3. 【高价值业务挖掘】：结合这些表的字段特征，建议如何进行分析或关联才能产生最大业务价值。\n"
+                    "要求：纯文字段落描述，使用 markdown 标题区隔。语言必须纯正【简体中文】。严禁重复输出巨大表格！"
+                )
+                
+                # 🔴 核心改动：这里换成了流式输出，彻底告别 504 卡死！
+                ai_advice = st.write_stream(call_ai_architect_stream(sys_prompt, "全库画像"))
+                
+                # 写入缓存
+                st.session_state.data_profile_cache = ai_advice
+                try:
+                    os.makedirs(os.path.dirname(cache_file_path), exist_ok=True)
+                    with open(cache_file_path, "w", encoding="utf-8") as f:
+                        f.write(f"\n" + st.session_state.data_profile_cache)
+                except Exception: pass
+                
+                status.update(label="✅ AI 深度体检报告生成完毕！", state="complete")
+            # ★ 修复：流式输出后删掉多余的 st.rerun()。
+            # write_stream 已将内容实时渲染到屏幕，再 rerun 只会让内容闪烁消失再重现。
+
+    # 渲染已缓存的报告
+    if st.session_state.get("data_profile_cache"):
+        with st.container(border=True):
+            st.markdown(st.session_state.data_profile_cache)
+            st.caption("ℹ️ 上方报告已持久化缓存。如对库表做了增删，请手动点击上方按钮重新扫描。")
+            
+    st.markdown("---")
+    
+    # ================= 2. 数据字典与管理区 =================
+    st.markdown("#### 📚 详细数据字典与资产管理")
+    st.caption("💡 提示：点击展开各个数据表，可查看多达 7 维的底层统计特征（包含非空率与数值极值）以及数据预览。")
+    
+    for t in tables:
+        try:
+            count = get_table_count(t)  # ★ 缓存版，不触发重复查库
+            with st.expander(f"🗂️ 实体表：**{t}** (总记录数：`{count}` 行)", expanded=False):
+                tab_dict, tab_preview, tab_action = st.tabs(["📊 字段极速体检字典", "👀 数据预览", "⚙️ 管理"])
+                
+                # 选项卡 A：字段统计字典（★ 懒加载，避免每次重绘都跑 SUMMARIZE 造成白屏）
+                with tab_dict:
+                    summary_key = f"summary_loaded_{t}"
+                    if not st.session_state.get(summary_key):
+                        st.caption("字段详情尚未加载，点击下方按钮触发（每张表仅需一次）。")
+                        if st.button(f"🔍 加载 `{t}` 的字段体检详情", key=f"load_summary_{t}"):
+                            st.session_state[summary_key] = True
+                            st.rerun()
+                    else:
+                        summary_df = execute_safe_query(f"SUMMARIZE {t}")
+                        display_md = "| 字段名称 | 字段类型 | 预估唯一值 | 空值率 | 主键候选 |\n"
+                        display_md += "| :--- | :--- | :--- | :--- | :--- |\n"
+                        for _, row in summary_df.iterrows():
+                            c_name = row['column_name']
+                            c_type = str(row['column_type']).upper()
+                            u_cnt = row['approx_unique']
+                            null_pct = row.get('null_percentage', '0%')
+                            is_pk = ""
+                            if pd.notna(u_cnt):
+                                is_pk = "🔑 是" if u_cnt >= count * 0.95 and count > 10 else ""
+                                display_md += f"| `{c_name}` | `{c_type}` | {int(u_cnt)} | {null_pct} | {is_pk} |\n"
+                            else:
+                                display_md += f"| `{c_name}` | `{c_type}` | - | {null_pct} | - |\n"
+                        st.markdown(display_md, unsafe_allow_html=True)
+                
+                # 预览区
+                with tab_preview:
+                    st.dataframe(execute_safe_query(f"SELECT * FROM {t} LIMIT 5"), hide_index=True, use_container_width=True)
+                
+                # 危险操作区
+                with tab_action:
+                    st.warning("⚠️ 此操作将直接从底层 DuckDB 中抹除该表及其所有数据。")
+                    if st.button(f"🗑️ 彻底删除数据表 [{t}]", key=f"del_btn_{t}"):
+                        execute_write(f"DROP TABLE {t}")
+                        invalidate_schema_cache()  # ★ 删表后清缓存
+                        st.session_state.pop(f"summary_loaded_{t}", None)
+                        st.session_state.data_profile_cache = ""
+                        st.rerun()
+        except Exception as e: 
+            st.error(f"加载表 {t} 失败：{e}")
+
+# ==========================================
+# TAB 3: 智能 VLOOKUP (预览即质检版：推演阶段直接出数预览 + 模拟质量体检 + 修复 Schema 传参)
+# ==========================================
+def render_join_tab():
+    st.markdown("### 🧩 智能 VLOOKUP (预览即质检模式)")
+    tables = get_business_tables()
+    if len(tables) < 2:
+        st.warning("⚠️ 仓库中至少需要 2 张表才能进行关联。")
+        return
+
+    # 🔴 状态管理：支持多轮对话、暂存 SQL 及预览数据
+    if "vl_chat_history" not in st.session_state: st.session_state.vl_chat_history = []
+    if "vl_pending_sql" not in st.session_state: st.session_state.vl_pending_sql = ""
+    md_ticks = "`" * 3
+
+    # ==========================================
+    # 1. 基础表单配置区
+    # ==========================================
+    with st.container(border=True):
+        col_base, col_target = st.columns(2)
+        with col_base:
+            st.markdown("##### 📄 1. 基础底表 (主表)")
+            base_tbl = st.selectbox("👉 选择主表：", tables, key="vl_base_tbl")
+            base_cols = get_table_schema(base_tbl)['column_name'].tolist()
+            base_key = st.selectbox("🔑 匹配特征列：", base_cols, key="vl_base_key")
+
+        with col_target:
+            st.markdown("##### 🎯 2. 目标来源 (去哪提取？)")
+            target_idx = 1 if len(tables) > 1 and tables[1] != base_tbl else 0
+            target_tbl = st.selectbox("👉 选择来源表：", tables, index=target_idx, key="vl_target_tbl")
+            target_cols = get_table_schema(target_tbl)['column_name'].tolist()
+            target_key = st.selectbox("🔑 匹配对应列：", target_cols, key="vl_target_key")
+            
+            available_ret_cols = [c for c in target_cols if c != target_key]
+            return_cols = st.multiselect("📦 要提取回来的字段：", available_ret_cols, key="vl_ret_cols")
+
+    st.markdown("---")
+
+    # ==========================================
+    # 2. 连续对话与“先验”预览区
+    # ==========================================
+    st.markdown("#### 💬 第一步：逻辑推演与即时质检")
+    
+    # 渲染历史记录（包含预览图表和质检结论）
+    for msg in st.session_state.vl_chat_history:
+        m_role = msg.get("role", "")
+        with st.chat_message(m_role):
+            st.markdown(msg.get("content", ""))
+            
+            if msg.get("sql"):
+                st.code(msg["sql"], language="sql")
+            
+            # 🔴 在对话流中展示预览和质检
+            if msg.get("preview_df") is not None:
+                st.markdown("⭐ **推演结果样本预览**：")
+                st.dataframe(msg["preview_df"], hide_index=True)
+                
+                if msg.get("qc"):
+                    qc = msg["qc"]
+                    col_q1, col_q2, col_q3 = st.columns(3)
+                    col_q1.metric("底表行数", f"{qc['base_cnt']:,}")
+                    col_q2.metric("模拟结果行数", f"{qc['res_cnt']:,}")
+                    diff = qc['res_cnt'] - qc['base_cnt']
+                    if diff > 0:
+                        col_q3.metric("⚠️ 膨胀预警", f"+{diff:,}", delta_color="inverse")
+                    else:
+                        col_q3.metric("✅ 匹配健康", "0 差异", delta_color="normal")
+
+    user_instr = st.text_area(
+        "🗣️ 输入清洗/匹配指令：", 
+        placeholder="例如：主表的特征列提取横杠后的6位再匹配；如果有重复请先去重...", 
+        height=80, key="vl_user_input"
+    )
+
+    col_btn_run, col_btn_clr = st.columns([3, 1])
+    with col_btn_run:
+        if st.button("🤖 智能推演并预览样本 (不创表)", type="primary", use_container_width=True):
+            if not return_cols:
+                st.error("❌ 请先勾选需要提取的字段！")
+                return
+            
+            p_text = user_instr.strip() if user_instr.strip() else "执行标准 VLOOKUP。"
+            st.session_state.vl_chat_history.append(dict(role="user", content=p_text))
+            
+            with st.spinner("AI 正在推演并拉取样本数据..."):
+                # 🔴 核心修复：在这里动态拼装两张表的 Schema 信息喂给大模型
+                all_schemas_info = f"Base Table A: `{base_tbl}` | Cols: {', '.join(base_cols)}\nTarget Table B: `{target_tbl}` | Cols: {', '.join(target_cols)}"
+                
+                sys_p = f"""You are a DuckDB Expert. 
+SCHEMA:\n{all_schemas_info}
+Base Key: "{base_key}"
+Target Key: "{target_key}"
+Return Cols: {return_cols}
+
+Task: SELECT query for VLOOKUP (LEFT JOIN). 
+RULES:
+1. Use CAST to VARCHAR and TRIM for keys. 
+2. Alias Source columns if needed to prevent duplicates. 
+3. Address the user's specific request.
+4. Output ONLY SQL in {md_ticks}sql."""
+                
+                history_data = []
+                for m in st.session_state.vl_chat_history:
+                    content = str(m.get("content", ""))
+                    if m.get("sql"): content += f"\n{md_ticks}sql\n{m['sql']}\n{md_ticks}"
+                    history_data.append(dict(role=str(m.get("role", "")), content=content))
+
+                ai_resp = call_ai_sql_coder(sys_p, history_data, "VLOOKUP先验")
+                sql_code, explain = extract_sql(ai_resp)
+
+                if sql_code:
+                    # 推演后立刻尝试执行（带反思纠错）
+                    max_retries = 3
+                    current_sql = sql_code
+                    preview_df, qc_data, final_error = None, None, None
+
+                    for attempt in range(max_retries):
+                        try:
+                            safe_sql = current_sql.strip().rstrip(';')
+                            # 1. 模拟执行预览 (Limit 5)
+                            preview_df = execute_safe_query(f"SELECT * FROM ({safe_sql}) LIMIT 5")
+                            # 2. 模拟全量行数质检 (用于显示膨胀)
+                            base_cnt = execute_safe_query(f'SELECT COUNT(*) FROM "{base_tbl}"').iloc[0,0]
+                            res_cnt = execute_safe_query(f"SELECT COUNT(*) FROM ({safe_sql})").iloc[0,0]
+                            qc_data = dict(base_cnt=base_cnt, res_cnt=res_cnt)
+                            final_error = None
+                            break
+                        except Exception as e:
+                            final_error = str(e)
+                            st.toast(f"🔄 推演报错，AI 正在第 {attempt+1} 次自我反思修复...", icon="🧠")
+                            fix_p = f"SQL failed: {final_error}\nFix it and output raw SQL in {md_ticks}sql. Pay attention to CAST types before using string functions."
+                            fix_resp = call_ai_sql_coder(fix_p, [{"role":"user","content":f"Broken SQL:\n{md_ticks}sql\n{current_sql}\n{md_ticks}"}], "推演纠错")
+                            new_sql, _ = extract_sql(fix_resp)
+                            if new_sql: current_sql = new_sql
+                            else: break
+                    
+                    if final_error:
+                        st.session_state.vl_chat_history.append(dict(role="assistant", content=f"❌ 推演失败：{final_error}", sql=current_sql))
+                    else:
+                        st.session_state.vl_pending_sql = current_sql
+                        st.session_state.vl_chat_history.append(dict(
+                            role="assistant", content=explain, sql=current_sql, 
+                            preview_df=preview_df, qc=qc_data
+                        ))
+                else:
+                    st.error("❌ AI 未能识别代码。")
+            st.rerun()
+
+    with col_btn_clr:
+        if st.button("🧹 清空记录", use_container_width=True):
+            st.session_state.vl_chat_history, st.session_state.vl_pending_sql = [], ""
+            st.rerun()
+
+    # ==========================================
+    # 3. 物理执行区 (确认建表)
+    # ==========================================
+    if st.session_state.vl_pending_sql:
+        st.markdown("---")
+        st.markdown("#### ✅ 第二步：确认方案并正式建表")
+        
+        target_name = st.text_input("💾 存为新表名：", value=f"{base_tbl}_vlookup", key="vl_out_name")
+        final_sql = st.text_area("🔧 最终执行逻辑 (可手工微调)：", value=st.session_state.vl_pending_sql, height=150, key="vl_final_editor")
+        
+        if st.button(f"🚀 确认无误，正式创建大表 [{target_name}]", type="primary", use_container_width=True):
+            with st.spinner("打包入库中..."):
+                try:
+                    safe_sql = final_sql.strip().rstrip(';')
+                    conn = get_db_connection()
+                    with db_lock:
+                        conn.execute(f'DROP TABLE IF EXISTS "{target_name}"')
+                        conn.execute(f'CREATE TABLE "{target_name}" AS ({safe_sql})')
+                    st.success(f"🎉 物理表 `[{target_name}]` 已持久化到硬盘！")
+                    invalidate_schema_cache()
+                except Exception as e:
+                    st.error(f"❌ 正式建表失败：{e}")
+
+# ==========================================
+# TAB 4: AI 连续对话分析 (全功能终极版：Agent纠错 + 模板适配 + 内存熔断 + 防Canvas Bug)
+# ==========================================
+def render_ai_chat_tab():
+    business_tables = get_business_tables()
+    if not business_tables:
+        st.warning("请先入库数据！")
+        return
+
+    # 定义模板存储的本地文件路径
+    TEMPLATE_FILE = os.path.join("global_data", "data_warehouse", "sql_templates.json")
+    
+    # 🔴 防护 1：用变量代替连续三个反引号，防止 Markdown 渲染器断层崩溃触发 Canvas Bug
+    md_ticks = "`" * 3
+
+    # 初始化状态
+    if "chat_step" not in st.session_state: st.session_state.chat_step = 1
+    if "ai_chat_history" not in st.session_state: st.session_state.ai_chat_history = []
+    if "chat_sql_editor" not in st.session_state: st.session_state.chat_sql_editor = ""
+    if "chat_df" not in st.session_state: st.session_state.chat_df = None
+    
+    # 每次初始化时，尝试从本地硬盘读取以前保存的模板
+    if "sql_templates" not in st.session_state:
+        st.session_state.sql_templates = {}
+        if os.path.exists(TEMPLATE_FILE):
+            try:
+                with open(TEMPLATE_FILE, "r", encoding="utf-8") as f:
+                    st.session_state.sql_templates = json.load(f)
+            except Exception:
+                pass
+
+    st.markdown("### 💬 AI 连续对话分析台")
+
+    col_opt1, col_opt2 = st.columns([3, 1])
+    with col_opt1:
+        analysis_mode_ai = st.radio("🔍 分析范围：", ["📄 选定单表", "🕸️ 多表联合分析"], horizontal=True, key="chat_scope_radio")
+    with col_opt2:
+        if st.button("🧹 清空历史与上下文", type="secondary", use_container_width=True, key="chat_clear_btn"):
+            st.session_state.ai_chat_history = []
+            st.session_state.chat_sql_editor = ""
+            st.session_state.chat_df = None
+            st.rerun()
+
+    # 延迟且按需提取 Schema，彻底根治全站 UI 切换时的白屏卡顿
+    sys_schema = ""
+    sys_rules = ""
+    selected_tables_for_ai = []
+
+    if analysis_mode_ai == "📄 选定单表":
+        sel_tbl = st.selectbox("👉 选择表：", business_tables, key="chat_sel_tbl")
+        selected_tables_for_ai = [sel_tbl]
+        with st.expander(f"👀 查看 `{sel_tbl}` 的前 5 行预览", expanded=False):
+            st.dataframe(execute_safe_query(f'SELECT * FROM "{sel_tbl}" LIMIT 5'), hide_index=True)
+    else:
+        selected_tables_for_ai = st.multiselect("👉 勾选参与分析的表：", business_tables, default=business_tables[:2] if len(business_tables)>=2 else business_tables, key="chat_multi_tbl")
+    
+    # 仅仅针对用户选中的 1~2 张表去底层查结构
+    if selected_tables_for_ai:
+        schema_lines = []
+        for t in selected_tables_for_ai:
+            cols_str = ", ".join([f"{r['column_name']}({r['column_type']})" for _, r in get_table_schema(t).iterrows()])
+            schema_lines.append(f"Table: `{t}` | Columns: {cols_str}")
+        sys_schema = "\n".join(schema_lines)
+        
+        if analysis_mode_ai == "📄 选定单表":
+            sys_rules = f"CRITICAL: MUST ONLY query from `{selected_tables_for_ai[0]}`. DO NOT use JOIN."
+        else:
+            sys_rules = f"You can use JOINs across the selected tables: {', '.join(selected_tables_for_ai)}. You also have access to previous 'ai_step' tables for intermediate results."
+
+    # ================= 🌟 独立的顶层抽屉：SQL 模板库 =================
+    with st.expander("🌟 SQL 模板库 (已开启永久本地保存)", expanded=False):
+        col_t1, col_t2 = st.columns([1, 1])
+        with col_t1:
+            st.markdown("##### 🚀 运行已有模板")
+            if st.session_state.sql_templates:
+                selected_tpl = st.selectbox("选择要跑的模板：", list(st.session_state.sql_templates.keys()), label_visibility="collapsed")
+                
+                col_btn_run, col_btn_del = st.columns([3, 1])
+                with col_btn_run:
+                    if st.button("🤖 智能适配 (先预览代码)", type="primary", use_container_width=True):
+                        raw_sql = st.session_state.sql_templates[selected_tpl]
+                        
+                        adapt_prompt = (
+                            f"**[预览模式] 智能适配模板：{selected_tpl}**\n\n"
+                            f"请将以下 SQL 模板智能适配到我当前圈选的数据表中：\n"
+                            f"1. 分析当前上下文的 Schema，自动替换掉模板中不存在的表名或字段名。\n"
+                            f"2. 严格保持模板原有的核心业务逻辑（如聚合、比例、排序等）。\n\n"
+                            f"**原始模板代码**：\n{md_ticks}sql\n{raw_sql}\n{md_ticks}"
+                        )
+                        
+                        if st.session_state.ai_chat_history and st.session_state.ai_chat_history[-1].get("role") == "user":
+                            st.session_state.ai_chat_history.pop()
+                            
+                        # 🔴 防护 2：使用 dict() 赋值，避开解析器大括号 Bug
+                        st.session_state.ai_chat_history.append(dict(role="user", content=adapt_prompt))
+                        st.rerun()
+
+                with col_btn_del:
+                    if st.button("🗑️ 删除", use_container_width=True):
+                        del st.session_state.sql_templates[selected_tpl]
+                        try:
+                            with open(TEMPLATE_FILE, "w", encoding="utf-8") as f:
+                                json.dump(st.session_state.sql_templates, f, ensure_ascii=False, indent=2)
+                        except: pass
+                        st.success("已删除！")
+                        st.rerun()
+            else:
+                st.info("📭 你的模板库还是空的。")
+
+        with col_t2:
+            st.markdown("##### ➕ 录入新模板")
+            new_tpl_name = st.text_input("给模板起个名：", placeholder="例如：地市各频段对齐率扫描表", label_visibility="collapsed")
+            new_tpl_sql = st.text_area("在此粘贴 SQL 代码：", height=120, placeholder="粘贴 SQL...", label_visibility="collapsed")
+            if st.button("💾 添加到模板库 (永久保存)", use_container_width=True):
+                if new_tpl_name.strip() and new_tpl_sql.strip():
+                    st.session_state.sql_templates[new_tpl_name.strip()] = new_tpl_sql.strip()
+                    try:
+                        os.makedirs(os.path.dirname(TEMPLATE_FILE), exist_ok=True)
+                        with open(TEMPLATE_FILE, "w", encoding="utf-8") as f:
+                            json.dump(st.session_state.sql_templates, f, ensure_ascii=False, indent=2)
+                        st.success(f"✅ 成功收入囊中并永久保存：{new_tpl_name.strip()}")
+                    except Exception as e:
+                        st.error(f"⚠️ 保存到硬盘失败：{e}")
+                    st.rerun()
+                else:
+                    st.warning("名称和代码都不能为空。")
+
+    st.markdown("---")
+
+    # ================= 💬 核心：垂直瀑布流渲染区 =================
+    if not st.session_state.ai_chat_history:
+        st.caption("👋 欢迎！请在最下方的输入框中提出您的第一条计算需求。")
+        
+    for i, msg in enumerate(st.session_state.ai_chat_history):
+        msg_role = msg.get("role", "")
+        with st.chat_message(msg_role):
+            if msg_role == "user":
+                st.markdown(msg.get("content", ""))
+            else:
+                st.markdown(msg.get("content", ""), unsafe_allow_html=True)
+
+                if msg.get("sql"):
+                    is_last = (i == len(st.session_state.ai_chat_history) - 1)
+                    with st.expander("⚙️ 思考过程与底层 SQL (点击展开查看或修改)", expanded=is_last):
+                        if is_last:
+                            edited_sql = st.text_area("您可以直接在此修改代码并手动重跑：", value=msg["sql"], height=200, key=f"edit_sql_{i}")
+                            if st.button("▶️ 确认修改并重跑代码", key=f"rerun_btn_{i}"):
+                                with st.spinner("手动执行中..."):
+                                    try:
+                                        table_name = msg.get("table_name", f"ai_step_{st.session_state.chat_step}")
+                                        conn = get_db_connection()
+                                        with db_lock:
+                                            conn.execute(f'DROP TABLE IF EXISTS "{table_name}"')
+                                            conn.execute(f'CREATE TEMPORARY TABLE "{table_name}" AS {edited_sql}')
+                                            
+                                            # 🔴 核心能力找回：后端内存保护 (重跑代码时)
+                                            total_r = conn.execute(f'SELECT COUNT(*) FROM "{table_name}"').fetchone()[0]
+                                            if total_r > 10000:
+                                                res_df = conn.execute(f'SELECT * FROM "{table_name}" LIMIT 10000').df()
+                                                st.session_state.ai_chat_history[i]["is_huge"] = True
+                                                st.session_state.ai_chat_history[i]["total_rows"] = total_r
+                                            else:
+                                                res_df = conn.execute(f'SELECT * FROM "{table_name}"').df()
+                                                st.session_state.ai_chat_history[i]["is_huge"] = False
+                                        
+                                        st.session_state.ai_chat_history[i]["sql"] = edited_sql
+                                        st.session_state.ai_chat_history[i]["df"] = res_df
+                                        st.session_state.ai_chat_history[i]["error"] = None
+                                        st.rerun()
+                                    except Exception as e:
+                                        st.session_state.ai_chat_history[i]["sql"] = edited_sql
+                                        st.session_state.ai_chat_history[i]["error"] = str(e)
+                                        st.session_state.ai_chat_history[i]["df"] = None
+                                        st.rerun()
+                        else:
+                            st.code(msg["sql"], language="sql")
+
+                if msg.get("error"):
+                    st.error(f"❌ SQL 执行报错：\n{msg['error']}\n\n👉 提示：你可以直接展开上方【思考框】修改代码，或者在最下方追问框告诉 AI 怎么修。")
+
+                if msg.get("df") is not None:
+                    df = msg["df"]
+                    if len(df) == 0:
+                        st.warning(f"⚠️ SQL 执行成功，但结果为 0 行。生成的中间表: `{msg.get('table_name')}`。")
+                    else:
+                        if msg.get("is_huge"):
+                            st.error(f"🚨 **UI 内存熔断保护触发**：原始结果集共有 **{msg.get('total_rows'):,}** 行数据！为防止网页卡死，内存中仅为您加载 10,000 行。")
+                            
+                            # 🔴 核心演进：动用 DuckDB 原生导出引擎，生成【全量数据】提供下载！
+                            with st.spinner("📦 正在底层极速打包全量 CSV 数据..."):
+                                full_csv_bytes = fast_table_to_csv_bytes(msg.get("table_name"), msg.get("sql", str(i)))
+                            
+                            st.download_button(
+                                label=f"📦 一键下载全量结果集 (CSV, 包含完整的 {msg.get('total_rows'):,} 行)", 
+                                data=full_csv_bytes, 
+                                file_name=f"{msg.get('table_name')}_FULL.csv", 
+                                mime="text/csv", 
+                                key=f"dl_huge_{i}"
+                            )
+                        else:
+                            st.success(f"✅ 执行成功，共命中 {len(df):,} 行。中间表名: `{msg.get('table_name')}`。")
+                            csv_data = fast_df_to_csv(df, msg.get("sql", str(i))) 
+                            st.download_button(label="📥 导出完整结果集 (CSV)", data=csv_data, file_name=f"{msg.get('table_name')}.csv", mime="text/csv", key=f"dl_{i}")
+                        
+                        # 🔴 无论全量多大，前端永远只老老实实渲染 200 行保命
+                        if len(df) > 200:
+                            st.caption("💡 UI 仅截断展示前 200 行，完整数据请点击上方下载按钮。")
+                            st.dataframe(df.head(200), use_container_width=True)
+                        else:
+                            st.dataframe(df, use_container_width=True)
+
+    # ================= ✍️ 底部吸附式追问框 =================
+    user_q = st.chat_input("输入需求、追问指令或报错信息 (例如：按地市汇总 / 报错了：Column not found)...", key="chat_input_box")
+    
+    if user_q:
+        if st.session_state.ai_chat_history and st.session_state.ai_chat_history[-1].get("role") == "user":
+            st.session_state.ai_chat_history.pop()
+
+        # 🔴 防护 3：隔离直接拼接语法
+        st.session_state.ai_chat_history.append(dict(role="user", content=user_q))
+        st.rerun()
+
+    # ================= 🧠 后台 AI 引擎处理逻辑 =================
+    if st.session_state.ai_chat_history and st.session_state.ai_chat_history[-1].get("role") == "user":
+        
+        current_user_msg = st.session_state.ai_chat_history[-1].get("content", "")
+        is_preview_mode = current_user_msg.startswith("**[预览模式]")
+
+        with st.chat_message("assistant"):
+            with st.spinner("AI 推演代码与自动执行中..."):
+                last_sql = ""
+                for m in reversed(st.session_state.ai_chat_history):
+                    if m.get("sql"):
+                        last_sql = m["sql"]
+                        break
+
+                sys_p = f"""You are an Expert DuckDB Data Architect. 
+SCHEMA:\n{sys_schema}
+RULES:\n1.{sys_rules}
+2. Geospatial: acos(sin(radians(lat1))*sin(radians(lat2)) + cos(radians(lat1))*cos(radians(lat2))*cos(radians(lon2)-radians(lon1))) * 6371000
+3. CTE PREFERENCE: STRONGLY prefer CTEs (WITH clause) for complex multi-step analysis.
+4. ROBUSTNESS: Handle Division by Zero with NULLIF(divisor, 0). Use COALESCE for NULLs. Cast to float using 100.0 or 1.0. ROUND(val, 2).
+5. WIDE TABLE OPTIMIZATION: Prefer Conditional Aggregation (SUM(CASE WHEN...)) to pivot data over multiple JOINs.
+6. COMPLEX JOINS & TEXT MATCHING (CRITICAL):
+   - For multi-table operations (3+ tables), logically deduce the correct join paths based on column names.
+   - If the user mentions fuzzy matching or nested text (e.g., joining 'A' with '0-A-0'), you MUST use DuckDB string functions (e.g., LIKE, CONTAINS, SPLIT_PART, REGEXP_EXTRACT, SUBSTRING) directly in the JOIN ON clause or in a preceding CTE to extract the pure key before joining.
+7. SYNTAX STRICTNESS: NEVER use backticks (`) for identifiers! DuckDB uses PostgreSQL syntax. You MUST use double quotes (") for table and column names if they contain special characters or spaces.
+8. Output raw SQL wrapped in {md_ticks}sql.
+9. LANGUAGE CONSTRAINT: 你的所有思考过程、逻辑推演和最终的文字解释，必须且只能使用【简体中文】输出！"""
+                
+                if last_sql:
+                    sys_p += f"\n\n[CRITICAL CONTEXT - CURRENT WORKING SQL]:\nThe user was last working with this SQL:\n{md_ticks}sql\n{last_sql}\n{md_ticks}\nIf the user is asking for a modification or fixing an error, use this SQL as the base."
+
+                # 🔴 防护 4：严密组装历史记录，杜绝大括号组合
+                history_for_llm = []
+                for m in st.session_state.ai_chat_history:
+                    msg_text = str(m.get('content', ''))
+                    if m.get('error'):
+                        msg_text += f"\n(Error encountered: {m['error']})"
+                    history_for_llm.append(dict(role=str(m.get('role', '')), content=msg_text))
+
+                ai_resp = call_ai_sql_coder(sys_p, history_for_llm, "对话分析")
+                clean_sql, exp = extract_sql(ai_resp)
+                
+                step_id = st.session_state.chat_step
+                tmp_table_name = f"ai_step_{step_id}"
+                res_df = None
+                error_msg = None
+                is_huge = False
+                total_rows = 0
+
+                if clean_sql:
+                    if is_preview_mode:
+                        exp = "💡 **代码已根据当前表结构为您智能适配完毕！**\n\n👇 确认无误后，请点击下方框内的 **【▶️ 确认修改并重跑代码】** 按钮执行查数。\n\n" + exp
+                    else:
+                        max_retries = 3
+                        current_sql = clean_sql
+                        current_exp = exp
+                        retry_log = [] 
+                        
+                        for attempt in range(max_retries):
+                            try:
+                                conn = get_db_connection()
+                                with db_lock:
+                                    conn.execute(f'DROP TABLE IF EXISTS "{tmp_table_name}"')
+                                    conn.execute(f'CREATE TEMPORARY TABLE "{tmp_table_name}" AS {current_sql}')
+                                    
+                                    # 🔴 核心能力找回：后端内存保护 (AI第一次运行时)
+                                    total_rows = conn.execute(f'SELECT COUNT(*) FROM "{tmp_table_name}"').fetchone()[0]
+                                    if total_rows > 10000:
+                                        res_df = conn.execute(f'SELECT * FROM "{tmp_table_name}" LIMIT 10000').df()
+                                        is_huge = True
+                                    else:
+                                        res_df = conn.execute(f'SELECT * FROM "{tmp_table_name}"').df()
+                                        is_huge = False
+                                
+                                st.session_state.chat_step += 1
+                                clean_sql = current_sql
+                                error_msg = None
+                                
+                                if attempt > 0:
+                                    retry_detail = "\n".join([
+                                        f"**第 {j+1} 次尝试**\n- 报错：`{err}`\n- SQL：\n{md_ticks}sql\n{sql}\n{md_ticks}"
+                                        for j, (sql, err) in enumerate(retry_log)
+                                    ])
+                                    exp = (
+                                        f"*(🤖 架构师自动修复成功，共经历 {attempt} 次反思)*\n\n"
+                                        + current_exp
+                                        + f"\n\n<details><summary>🔧 点击展开修复过程（共 {attempt} 次失败）</summary>\n\n{retry_detail}\n\n</details>"
+                                    )
+                                else:
+                                    exp = current_exp
+                                    
+                                break 
+
+                            except Exception as e:
+                                error_msg = str(e)
+                                retry_log.append((current_sql, error_msg)) 
+                                if attempt < max_retries - 1:
+                                    st.toast(f"🔄 AI 遇到底层报错，正在进行第 {attempt + 1} 次深度反思与自动修复...", icon="🧠")
+                                    
+                                    fix_prompt = (
+                                        f"刚才执行这句 SQL 时遇到了报错：\n{md_ticks}sql\n{current_sql}\n{md_ticks}\n"
+                                        f"报错信息：\n{error_msg}\n\n"
+                                        f"请深度思考这个报错原因（可能是类型无法 CAST、拼写错误或字段缺失等）。"
+                                        f"请先用一段话写出你的反思和修复逻辑，然后再输出修复后的最新 SQL 代码。"
+                                    )
+                                    
+                                    # 🔴 防护 5：严密组装纠错历史
+                                    fix_history = list(history_for_llm)
+                                    fix_history.append(dict(role="assistant", content=f"{current_exp}\n{md_ticks}sql\n{current_sql}\n{md_ticks}"))
+                                    fix_history.append(dict(role="user", content=fix_prompt))
+                                    
+                                    ai_fix_resp = call_ai_sql_coder(sys_p, fix_history, f"自动纠错_第{attempt+1}次")
+                                    new_sql, new_exp = extract_sql(ai_fix_resp)
+                                    
+                                    if new_sql:
+                                        current_sql = new_sql
+                                        current_exp = new_exp
+                                    else:
+                                        clean_sql = current_sql
+                                        exp = current_exp
+                                        break
+                                else:
+                                    clean_sql = current_sql
+                                    exp = current_exp
+
+                else:
+                    error_msg = "未检测到有效的 SQL 代码输出。"
+
+                # 🔴 防护 6：严密组装最后一条写入记录
+                st.session_state.ai_chat_history.append(dict(
+                    role="assistant", 
+                    content=exp, 
+                    sql=clean_sql, 
+                    df=res_df, 
+                    error=error_msg, 
+                    table_name=tmp_table_name,
+                    is_huge=is_huge,
+                    total_rows=total_rows
+                ))
+                st.rerun()
+
+                
+# ==========================================
+# TAB 5: 手工透视 (跨表圈选 + 自定义算式 + 经典四象限筛选)
+# ==========================================
+def render_manual_pivot_tab():
+    tables = get_business_tables()
+    if not tables:
+        st.warning("请先入库数据！")
+        return
+        
+    st.markdown("### 🖱️ 智能手工全量透视表 (支持计算字段与范围圈选)")
+    mode = st.radio("🔍 透视范围：", ["📄 单表透视", "🕸️ 跨表透视 (字段混选，AI动态关联)"], horizontal=True, key="pivot_scope_radio")
+    
+    selected_tables = []
+    if mode == "📄 单表透视":
+        sel_tbl = st.selectbox("👉 选择表：", tables, key="pivot_sel_tbl")
+        selected_tables = [sel_tbl]
+        with st.expander(f"👀 查看 `{sel_tbl}` 的前 5 行预览", expanded=False): 
+            st.dataframe(execute_safe_query(f"SELECT * FROM {sel_tbl} LIMIT 5"), hide_index=True)
+        table_cols = get_table_schema(sel_tbl)['column_name'].tolist()
+    else:
+        st.info("💡 跨表模式：请选择需要参与跨表的实体表，AI 会仅围绕您选定的表推演 JOIN 逻辑。")
+        selected_tables = st.multiselect("👉 选择参与跨表的实体表：", tables, default=tables[:2] if len(tables)>=2 else tables, key="pivot_multi_tbl")
+        
+        all_schemas_info = ""
+        table_cols = []
+        if selected_tables:
+            with st.expander("📚 已选表的可用字典", expanded=True):
+                for t in selected_tables:
+                    cols = get_table_schema(t)['column_name'].tolist()
+                    all_schemas_info += f"Table: `{t}` | Cols: {', '.join(cols)}\n"
+                    for c in cols: table_cols.append(f"[{t}] {c}")
+                    st.markdown(f"**`{t}`**: `" + "` , `".join(cols) + "`")
+
+    if not selected_tables:
+        return
+
+    with st.form("pivot_config_form", clear_on_submit=False):
+        # 严格遵循 Excel 习惯：筛选、行、列、值
+        col_f, col_r, col_c, col_v = st.columns(4)
+        
+        with col_f:
+            pivot_filters = st.multiselect("👉 【筛选】(可选)：", table_cols, key="pivot_f")
+            st.caption("配合下方填写具体条件")
+        with col_r: 
+            pivot_rows = st.multiselect("👉 【行】(可选)：", table_cols, key="pivot_r")
+        with col_c: 
+            pivot_cols = st.multiselect("👉 【列】(可选)：", table_cols, key="pivot_c")
+        with col_v:
+            pivot_vals = st.multiselect("👉 【基础值】(可选)：", table_cols, key="pivot_v")
+            pivot_agg = st.selectbox("📐 基础聚合：", ["SUM", "COUNT", "COUNT DISTINCT", "AVG", "MAX", "MIN"], key="pivot_agg")
+
+        custom_calcs_input = st.text_input("➕ 添加计算字段 (例如: SUM(收入)/SUM(成本) AS 利润率)：", placeholder="支持直接写 SQL 表达式，多个字段用逗号分隔...", key="pivot_calc_input")
+
+        # 🔴 核心演进：拓宽输入框语义，将其定义为全局“业务需求中枢”，而不再仅仅是条件过滤器
+        nl_condition = st.text_area("🗣️ 附加业务需求与条件筛选 (大白话自由输入)：", placeholder="例如：1. 过滤条件（只要华为和中兴）；2. 复杂业务逻辑（算完后只取排名前3的记录，或者按某种规则计算同环比等）...", key="pivot_nl_cond")
+
+        submitted = st.form_submit_button("🚀 立即全量透视", type="primary", use_container_width=True)
+
+    if submitted:
+        with st.spinner("AI 意图解析与底层运算中..."):
+            try:
+                where_clause = ""
+                # 彻底净化 AI 生成的 WHERE 语句，防止 Markdown 符号导致底层 SQL 运行崩溃
+                if (nl_condition.strip() or pivot_filters) and mode == "📄 单表透视":
+                    if pivot_filters and not nl_condition.strip():
+                        st.warning("⚠️ 您选择了【筛选】字段但未填写过滤条件，请在下方说明框描述筛选规则（例如：城市只要北京和上海）。")
+                        return  # 中断执行，等用户补充
+                    else:
+                        user_intent = nl_condition.strip()
+                        sys_p = f"Table: {sel_tbl}\nCols: {table_cols}\nTarget Filter Columns: {pivot_filters}\nTask: Convert User Intent to a valid SQL WHERE clause. ONLY output the pure SQL condition. DO NOT output the word WHERE. NO markdown formatting. Use acos/sin/cos for distance * 6371000."
+                        raw_where = call_ai_sql_coder(sys_p, [{"role":"user","content":user_intent}], "透视条件翻译")
+                        
+                        # 极致净化提取逻辑
+                        clean_where, _ = extract_sql(raw_where)
+                        if not clean_where: clean_where = raw_where.replace("```sql", "").replace("```", "").strip()
+                        clean_where = re.sub(r'(?i)^\s*WHERE\s+', '', clean_where).strip()
+                        where_clause = clean_where
+                        
+                    st.info(f"🤖 AI 生成过滤逻辑：`{where_clause}`")
+
+                val_exprs = [f"COUNT(DISTINCT \"{v}\") AS \"{v}_去重\"" if "DISTINCT" in pivot_agg else f"{pivot_agg.split(' ')[0]}(\"{v}\") AS \"{v}_聚合\"" for v in pivot_vals]
+                if custom_calcs_input.strip():
+                    val_exprs.append(custom_calcs_input.strip())
+                if not val_exprs:
+                    val_exprs = ["COUNT(*) AS \"记录数\""]
+
+                v_sql = ", ".join(val_exprs)
+
+                if mode == "📄 单表透视":
+                    s_sql = f'"{sel_tbl}"'
+                    if where_clause: s_sql = f"(SELECT * FROM {s_sql} WHERE {where_clause})"
+                    
+                    if pivot_cols:
+                        p_cols = ", ".join([f'"{c}"' for c in pivot_cols])
+                        if pivot_rows:
+                            r_grp = f"GROUP BY {', '.join([f'\"{c}\"' for c in pivot_rows])}"
+                            final_sql = f"PIVOT {s_sql} ON {p_cols} USING {v_sql} {r_grp}"
+                        else:
+                            # 如果用户只要列、不要行，使用虚拟全量汇总列兜底，防止 DuckDB 乱入冗余字段
+                            final_sql = f"PIVOT (SELECT '全量汇总' AS \"_全局汇总\", * FROM {s_sql}) ON {p_cols} USING {v_sql} GROUP BY \"_全局汇总\""
+                    else:
+                        if pivot_rows:
+                            r_cols = ", ".join([f'"{c}"' for c in pivot_rows])
+                            final_sql = f"SELECT {r_cols}, {v_sql} FROM {s_sql} GROUP BY {r_cols} ORDER BY {r_cols}"
+                        else:
+                            # 行和列都为空，直接输出全局大聚合
+                            final_sql = f"SELECT {v_sql} FROM {s_sql}"
+                else:
+                    # 🔴 核心演进：在跨表模式下，明确要求大模型执行用户输入的【任何复杂的额外业务意图】（如 Top N、开窗函数等）
+                    sys_p = f"""SCHEMA:\n{all_schemas_info}
+Rows:{pivot_rows} (optional), Cols:{pivot_cols} (optional), Base Vals:{pivot_vals}(Agg:{pivot_agg}), Target Filter Cols:{pivot_filters}, Custom Calculated Fields:[{custom_calcs_input}], Additional Business Intent:{nl_condition}
+Task: Write DuckDB SQL. USE PIVOT if cols requested.
+CRITICAL RULES:
+1. ENSURE you seamlessly include the Custom Calculated Fields in the query.
+2. MUST prevent Division by Zero using NULLIF(divisor, 0).
+3. Handle NULLs with COALESCE(). Cast ints to float by multiplying 1.0. Apply ROUND(val, 2).
+4. If Rows are empty, aggregate globally.
+5. ⚠️ CRITICAL BUSINESS INTENT: You MUST accurately implement the complex logic in "Additional Business Intent".
+6. COMPLEX JOINS & TEXT MATCHING: If tables lack exact matching keys or the user hints at text differences (e.g., joining 'A' with '0-A-0'), actively use DuckDB string functions (LIKE, REGEXP_EXTRACT, SPLIT_PART) in the ON clause to bridge the gap. NEVER use backticks (`).
+7. LANGUAGE CONSTRAINT: 你的所有的思考、分析和解释说明必须使用【简体中文】！
+Output raw SQL in ```sql."""
+
+                    ai_resp = call_ai_sql_coder(sys_p, [{"role":"user","content":"Generate SQL"}], "跨表透视生成")
+                    final_sql, _ = extract_sql(ai_resp)
+                    st.info(f"🤖 底层执行 SQL：\n```sql\n{final_sql}\n```")
+
+                res_df = execute_safe_query(final_sql)
+                
+                st.markdown(f"##### 📊 全量完成 (命中 {len(res_df)} 条)")
+                
+                csv_data = fast_df_to_csv(res_df, final_sql)
+                
+                if len(res_df) > 10000:
+                    st.info("💡 探测到超过 1 万行的超大数据集！为防止浏览器卡死，已为您折叠预览界面，请直接下载文件。")
+                    st.download_button(label="📦 一键下载超大透视结果 (CSV)", data=csv_data, file_name="pivot_results.csv", mime="text/csv", key="pivot_download_huge")
+                else:
+                    st.download_button(label="📥 导出完整透视结果 (CSV)", data=csv_data, file_name="pivot_results.csv", mime="text/csv", key="pivot_download")
+                    if len(res_df) > 500:
+                        st.warning("⚠️ UI 仅截断前 500 行展示，完整数据请点击上方导出按钮。")
+                        st.dataframe(res_df.head(500), use_container_width=True)
+                    else:
+                        st.dataframe(res_df, use_container_width=True)
+            except Exception as e: st.error(f"透视执行或语法生成失败：{e}")
