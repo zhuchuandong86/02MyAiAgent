@@ -1,0 +1,269 @@
+import os
+import re
+import yaml
+import json
+import subprocess
+import streamlit as st
+from datetime import datetime
+from apscheduler.schedulers.background import BackgroundScheduler
+from core.llm_factory import get_llm
+
+
+# ======= 你的自定义包引入 (请按需保留) =======
+# import core.paths
+# from core.settings import settings
+# from core.llm_factory import get_openai_client
+# from core.token_tracker import log_usage
+# client = get_openai_client()
+# ============================================
+
+# 备用方案：标准 OpenAI 初始化
+from openai import OpenAI
+client = get_llm() 
+
+# 路径推导逻辑
+CURRENT_DIR = os.path.dirname(os.path.abspath(__file__))
+AGENT_ROOT = os.path.dirname(CURRENT_DIR)
+SKILLS_DIR = os.path.join(AGENT_ROOT, "skills")
+
+# ================= 核心元能力 1：定时任务引擎 =================
+@st.cache_resource
+def get_scheduler():
+    """使用 Streamlit 缓存机制保证全局只有一个调度器实例"""
+    scheduler = BackgroundScheduler()
+    scheduler.start()
+    return scheduler
+
+scheduler = get_scheduler()
+
+def execute_shell_command(command: str) -> str:
+    """元能力: 空间操作 (立即执行)"""
+    try:
+        result = subprocess.run(command, shell=True, capture_output=True, encoding='utf-8', errors='ignore', timeout=120)
+        output = result.stdout + result.stderr
+        return output[:4000] if output else "[命令执行成功，无输出]"
+    except Exception as e:
+        return f"执行出错: {str(e)}"
+
+def background_task_wrapper(command: str, task_id: str):
+    """后台任务包装器，将输出重定向到日志文件，方便大模型后续查看"""
+    log_file = os.path.join(AGENT_ROOT, "scheduler.log")
+    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    try:
+        result = subprocess.run(command, shell=True, capture_output=True, encoding='utf-8', errors='ignore')
+        output = result.stdout + result.stderr
+        with open(log_file, "a", encoding="utf-8") as f:
+            f.write(f"\n[{timestamp}] [Task: {task_id}] CMD: {command}\n{output}\n")
+    except Exception as e:
+        with open(log_file, "a", encoding="utf-8") as f:
+            f.write(f"\n[{timestamp}] [Task: {task_id}] ERROR: {str(e)}\n")
+
+def manage_scheduled_task(action: str, task_id: str, command: str = "", cron_expr: str = ""):
+    """元能力: 时间操作 (定时/延时任务)"""
+    if action == "add":
+        if scheduler.get_job(task_id):
+            return f"任务添加失败：任务ID '{task_id}' 已存在。"
+        try:
+            # 简单解析 cron 表达式 (如 "* * * * *" -> minute, hour, day, month, day_of_week)
+            parts = cron_expr.split()
+            if len(parts) != 5:
+                return "cron表达式格式错误，需要5个部分 (如 '*/5 * * * *')"
+            minute, hour, day, month, day_of_week = parts
+            scheduler.add_job(
+                background_task_wrapper, 
+                'cron', 
+                minute=minute, hour=hour, day=day, month=month, day_of_week=day_of_week,
+                args=[command, task_id], 
+                id=task_id
+            )
+            return f"定时任务 '{task_id}' 添加成功！Cron: {cron_expr}。注意：后台输出将写入 {os.path.join(AGENT_ROOT, 'scheduler.log')}，你可以用 shell 命令查看该文件以获取执行结果。"
+        except Exception as e:
+            return f"添加任务出错: {e}"
+            
+    elif action == "remove":
+        if scheduler.get_job(task_id):
+            scheduler.remove_job(task_id)
+            return f"定时任务 '{task_id}' 已被移除。"
+        return f"未找到任务 '{task_id}'。"
+        
+    elif action == "list":
+        jobs = scheduler.get_jobs()
+        if not jobs: return "当前没有定时任务。"
+        job_list = "\n".join([f"- TaskID: {job.id}, Next Run: {job.next_run_time}" for job in jobs])
+        return f"当前运行的定时任务：\n{job_list}"
+    
+    return "未知的操作动作。"
+
+# ================= Skill 解析 =================
+class SkillManager:
+    def __init__(self):
+        self.skills = {}
+        self.load_skills()
+
+    def load_skills(self):
+        if not os.path.exists(SKILLS_DIR):
+            os.makedirs(SKILLS_DIR)
+        for item in os.listdir(SKILLS_DIR):
+            skill_path = os.path.join(SKILLS_DIR, item)
+            skill_md_path = os.path.join(skill_path, "SKILL.md")
+            if os.path.isdir(skill_path) and os.path.exists(skill_md_path):
+                with open(skill_md_path, 'r', encoding='utf-8') as f:
+                    match = re.match(r'^---\s*\n(.*?)\n---\s*\n(.*)', f.read(), re.DOTALL)
+                    if match:
+                        meta = yaml.safe_load(match.group(1))
+                        self.skills[meta.get('name', item)] = {
+                            "description": meta.get('description', 'No desc'),
+                            "path": skill_path,
+                            "content": match.group(2)
+                        }
+
+skill_manager = SkillManager()
+
+# ================= 大模型工具配置 =================
+tools = [
+    {
+        "type": "function",
+        "function": {
+            "name": "execute_shell_command",
+            "description": "立即执行终端/Shell命令。这是你与系统交互的唯一方式。",
+            "parameters": {
+                "type": "object",
+                "properties": {"command": {"type": "string", "description": "要执行的命令"}},
+                "required": ["command"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "manage_scheduled_task",
+            "description": "管理定时或后台任务（使用类 Linux cron 表达式）。",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "action": {"type": "string", "enum": ["add", "remove", "list"], "description": "操作类型"},
+                    "task_id": {"type": "string", "description": "任务的唯一英文字母标识"},
+                    "command": {"type": "string", "description": "要执行的shell命令（仅在 add 时需要）"},
+                    "cron_expr": {"type": "string", "description": "5位cron表达式，例如 '*/5 * * * *' 代表每5分钟运行一次（仅在 add 时需要）"}
+                },
+                "required": ["action", "task_id"]
+            }
+        }
+    }
+]
+
+system_prompt = """你是一个名为 Claw 的强大智能体（具备 UI 界面和后台环境）。
+你的能力极简，但具有无限演进能力。你有两个核心系统调用：
+1. `execute_shell_command`: 立即执行命令。遇到任务时自主执行，报错时自主修复代码。
+2. `manage_scheduled_task`: 创建定时/后台任务。当你需要"每小时监控数据"、"明天发送报告"等时间维度的任务时使用。
+
+注意：后台任务不会直接把结果返回到对话框。你应该将后台任务的输出重定向到文件，并在后续对话中通过 `cat` 等命令主动读取检查结果。
+"""
+
+# ================= Streamlit UI 与 交互主循环 =================
+st.set_page_config(page_title="Claw Agent OS", page_icon="🐾", layout="wide")
+
+# 初始化 Session 状态
+if "messages" not in st.session_state:
+    st.session_state.messages = [{"role": "system", "content": system_prompt}]
+
+# 侧边栏：状态面板与技能列表
+with st.sidebar:
+    st.title("🐾 Claw Control Panel")
+    st.markdown("---")
+    st.subheader("📚 Loaded Skills")
+    for name, info in skill_manager.skills.items():
+        if st.button(f"Load /{name}", key=f"btn_{name}", help=info['description']):
+            # 路由触发器
+            trigger_msg = f"加载技能 [{name}]。工作目录：{info['path']}。\n指南：\n{info['content']}\n\n请按照上述流程开始执行。"
+            st.session_state.messages.append({"role": "user", "content": trigger_msg})
+            st.rerun() # 触发页面重新加载并处理新消息
+
+    st.markdown("---")
+    st.subheader("⏱️ Background Tasks")
+    jobs = scheduler.get_jobs()
+    if not jobs:
+        st.info("No active tasks.")
+    else:
+        for job in jobs:
+            st.code(f"Task: {job.id}\nNext: {job.next_run_time.strftime('%H:%M:%S')}")
+    
+    if st.button("🧹 Clear Conversation History"):
+        st.session_state.messages = [{"role": "system", "content": system_prompt}]
+        st.rerun()
+
+# 主聊天界面
+st.title("Claw Terminal")
+
+# 渲染历史对话 (跳过 system prompt)
+for msg in st.session_state.messages[1:]:
+    role = msg.get("role")
+    if role == "tool":
+        # 工具执行结果使用折叠面板展示，避免满屏代码
+        with st.expander(f"🛠️ Tool Execution Result: {msg.get('name')}", expanded=False):
+            st.text(msg.get("content"))
+    elif role == "assistant":
+        if msg.get("content"):
+            with st.chat_message("assistant", avatar="🤖"):
+                st.markdown(msg.get("content"))
+        # 也可以选择不展示 tool_calls 的原始 JSON 参数，保持界面清爽
+    elif role == "user":
+        with st.chat_message("user", avatar="👤"):
+            st.markdown(msg.get("content"))
+
+# 处理用户输入
+if prompt := st.chat_input("输入指令或直接对话 (例如: 每过5分钟列出一次当前目录的文件)"):
+    # 1. 记录并显示用户输入
+    st.session_state.messages.append({"role": "user", "content": prompt})
+    with st.chat_message("user", avatar="👤"):
+        st.markdown(prompt)
+
+    # 2. 触发大模型循环
+    with st.spinner("Claw is thinking & working..."):
+        # 复制消息结构以避免 Streamlit session_state 深拷贝导致的问题
+        current_messages = [m for m in st.session_state.messages if "tool_call_id" not in m or m.get("role") == "tool"]
+        
+        while True:
+            response = client.chat.completions.create(
+                messages=st.session_state.messages,
+                tools=tools,
+                tool_choice="auto"
+            )
+            
+            msg = response.choices[0].message
+            # 将模型的原始返回转为 dict 并存入 session
+            msg_dict = msg.model_dump(exclude_none=True)
+            st.session_state.messages.append(msg_dict)
+            
+            # 如果模型调用了工具
+            if msg.tool_calls:
+                for tool_call in msg.tool_calls:
+                    args = json.loads(tool_call.function.arguments)
+                    func_name = tool_call.function.name
+                    
+                    # 界面上显示动作
+                    st.toast(f"Running Tool: {func_name}", icon="⚙️")
+                    
+                    if func_name == "execute_shell_command":
+                        cmd_result = execute_shell_command(args.get("command", ""))
+                    elif func_name == "manage_scheduled_task":
+                        cmd_result = manage_scheduled_task(
+                            action=args.get("action"),
+                            task_id=args.get("task_id"),
+                            command=args.get("command", ""),
+                            cron_expr=args.get("cron_expr", "")
+                        )
+                    else:
+                        cmd_result = "未知工具。"
+                    
+                    # 记录工具结果并喂回给大模型
+                    st.session_state.messages.append({
+                        "role": "tool",
+                        "tool_call_id": tool_call.id,
+                        "name": func_name,
+                        "content": cmd_result
+                    })
+                # 重新进入 while 循环，请求大模型
+            else:
+                # 任务完成，输出最后的内容
+                st.rerun()

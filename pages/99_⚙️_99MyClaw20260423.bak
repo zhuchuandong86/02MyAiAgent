@@ -1,0 +1,378 @@
+import json
+import time
+import os
+from datetime import datetime
+import streamlit as st
+
+os.environ['NO_PROXY'] = 'api.openai.rnd.huawei.com'
+
+
+import core.paths
+from core.settings import settings
+from core.llm_factory import get_openai_client
+from core.token_tracker import log_usage
+
+from modules.zclaw._registry import ZCLAW_TOOLS_SCHEMA, TOOL_DISPATCHER
+from modules.zclaw.memory_tools import search_memory
+from modules.zclaw.skill_tools import scan_skills
+
+b_model    = "qwen2.5-72b-instruct"#settings.MODEL_TEXT
+v_model    = settings.MODEL_VISION
+c_model    = getattr(settings, "MODEL_CODER", settings.MODEL_TEXT)
+fallback_1 = getattr(settings, "MODEL_EDITOR", settings.MODEL_TEXT)
+fallback_2 = getattr(settings, "MODEL_BLUE", settings.MODEL_TEXT)
+fallback_3 = getattr(settings, "MODEL_RED", settings.MODEL_TEXT)
+
+# ==========================================
+# [核心修复] 获取当前用户专属的动态工作区
+# ==========================================
+def get_user_workspace():
+    user = st.session_state.get("zclaw_user", "public")
+    ws_path = os.path.join(str(core.paths.GLOBAL_DATA_DIR), f"zclaw_workspace_{user}")
+    os.makedirs(os.path.join(ws_path, "skills"), exist_ok=True)
+    return ws_path
+
+def init_workspace():
+    ws_path = get_user_workspace()
+    mem_file = os.path.join(ws_path, "experience_log.md")
+    if not os.path.exists(mem_file):
+        with open(mem_file, "w", encoding="utf-8") as f:
+            f.write(f"# 【{st.session_state.get('zclaw_user', 'public')}】的专属经验法则\n\n")
+    return ws_path
+
+def call_llm(messages, tools=None, model_name=None, temperature=0.2):
+    """
+    单模型调用引擎：不再进行自动降级。
+    """
+    if not model_name:
+        raise ValueError("🚨 错误：未指定执行模型！")
+
+    client = get_openai_client()
+    
+    try:
+        kwargs = {
+            "model":       model_name,
+            "messages":    messages,
+            "temperature": temperature,
+        }
+        if tools:
+            kwargs["tools"] = tools
+
+        response = client.chat.completions.create(**kwargs)
+
+        if hasattr(response, "usage") and response.usage:
+            log_usage("ZClaw-自主引擎", model_name, response.usage.total_tokens)
+
+        return response.choices[0].message
+
+    except Exception as e:
+        # 直接抛出异常，不再尝试其他模型
+        raise Exception(f"🚨 模型 [{model_name}] 调用失败: {str(e)}")
+
+def call_llm_with_fallback(messages, tools=None, primary_model=None, fallback_models=None, temperature=0.2):
+    models_to_try = [primary_model] if primary_model else []
+    if fallback_models: models_to_try.extend([m for m in fallback_models if m])
+    seen = set()
+    models_to_try = [x for x in models_to_try if x and not (x in seen or seen.add(x))]
+    if not models_to_try: raise ValueError("🚨 严重错误：未配置任何可用的模型！")
+
+    client = get_openai_client()
+    last_error = ""
+    for current_model in models_to_try:
+        try:
+            kwargs = {"model": current_model, "messages": messages, "temperature": temperature}
+            if tools: kwargs["tools"] = tools
+            response = client.chat.completions.create(**kwargs)
+            if hasattr(response, "usage") and response.usage:
+                log_usage("ZClaw-自主引擎", current_model, response.usage.total_tokens)
+            return response.choices[0].message
+        except Exception as e:
+            last_error = str(e)
+            print(f"⚠️ 模型 [{current_model}] 调用失败: {last_error}。尝试降级切换...")
+            time.sleep(1)
+            continue
+    raise Exception(f"🚨 灾难性故障：所有备用模型均调用失败！最后报错: {last_error}")
+
+MAX_MSG_HISTORY = 40
+
+def _trim_messages() -> None:
+    msgs = st.session_state.zclaw_messages
+    if len(msgs) <= MAX_MSG_HISTORY + 1: return
+    sys_msg = msgs[0]
+    keep_msgs = msgs[-(MAX_MSG_HISTORY):]
+    
+    # 🌟【兼容补丁】：安全提取 role，通吃字典和 OpenAI API 对象
+    def _safe_get_role(msg_item):
+        if isinstance(msg_item, dict):
+            return msg_item.get("role")
+        return getattr(msg_item, "role", None)
+
+    # 【核心防御】：如果保留下来的第一条是 tool，把这条孤儿丢弃
+    while keep_msgs and _safe_get_role(keep_msgs[0]) == "tool":
+        keep_msgs.pop(0)
+        
+    st.session_state.zclaw_messages = [sys_msg] + keep_msgs
+
+# ==========================================
+# 🌟 新增：规划者 (Planner) 专属系统指令
+# ==========================================
+PLANNER_SYSTEM_PROMPT = """You are ZClaw Master Planner, an elite AI technical architect.
+你的唯一职责是：分析用户的目标、当前沙箱环境、记忆库和技能库，将任务拆解为逻辑严密、可被顺序执行的子任务清单。
+
+━━━━━━ 规划准则 (Planning Directives) ━━━━━━
+1. **前置摸底与指南读取**：第一步必须是环境探测（了解当前目录有什么文件）。如果发现存在 `skills` 文件夹，必须进一步探测其子文件夹，并强制读取里面所有的 `SKILL.md` 或 `.md` 格式的经验指南文件，然后再制定后续计划。
+2. **渐进式执行**：复杂任务（如爬虫、数据处理）必须分步骤：先写脚本 -> 运行检查中间数据 -> 再写下一步逻辑。
+3. **物理隔离认知**：规划的所有操作必须限定在提供的沙箱路径内。
+4. **闭环验证**：最后一步必须包含对最终产物的确认和读取。
+
+你必须严格按以下 Markdown CheckBox 格式输出你的计划，不要说任何多余的废话：
+### 📋 ZClaw 全局执行计划
+1. [ ] **环境探测与分析**：...
+2. [ ] **核心模块开发/执行**：...
+3. [ ] **结果验证与纠错**：...
+4. [ ] **最终交付闭环**：...
+"""
+
+# ==========================================
+# 🌟 修改 1：将 Executor 的 System Prompt 强化 CoT 与计划跟随
+# ==========================================
+EXECUTOR_SYSTEM_PROMPT= """You are ZClaw (zclawEdition), an autonomous AI engineer.
+
+━━━━━━ 🛠️ 核心执行指令 (Core Directives) ━━━━━━
+1. **环境侦测 (Explore First)**: 只有在明确需要处理本地文件时，才调用 `execute_bash` (ls, pwd) 摸清工作区。严禁在纯线上资讯查询任务中执行无意义的本地环境检查。
+2. **记忆优先 (Memory & Skills)**: 在制定计划前，优先查阅当前环境变量中的记忆和技能。严禁重复编写已存在的复杂逻辑。
+3. **工具绝对优先 (Tools Over Code - 核心铁律)**: 
+   - 遇到需要获取网络信息、抓取网页、搜索新闻的任务，**只能且必须**使用系统提供的 `search_web`, `read_webpage` 或 `browse_and_act` 工具！
+   - 【物理禁令】：**严禁**编写任何包含 `requests`, `urllib`, `BeautifulSoup`, `selenium` 或网络请求逻辑的 .py 脚本！你必须使用预置工具，禁止自己手搓爬虫！
+   - 只有对于本地纯数据处理（如 JSON 转 CSV、文本清洗），才允许调用 `write_file` 编写脚本并用 `execute_bash` 运行。
+4. **自主进化 (Self-Evolution)**: 
+   - 遇到报错（如缺少库、语法错误、网络超时）是成功的必经之路。必须调用 `search_web` 寻找报错原因并自主修复。
+   - 只有在经历“报错 -> 分析 -> 修复 -> 成功”的完整闭环后，必须调用 `append_memory` 记录经验。
+5. **规范通讯 (Tool Formatting)**: 仅允许使用标准的 API Function Calling 格式。严禁在正文中伪造工具调用标签。
+6. **信息求真 (Truth Seeking)**: 遇到任何不确定、过时的信息，立刻调用 `search_web`。严禁回答“我无法访问互联网”。
+7. **深度自主 (Silent Perseverance)**: 除非在同一环节连续失败 5 次且无法通过搜索解决，否则禁止询问用户“是否继续”。你的目标是直接交付结果。
+8. **自我扩充 (Self-Extension)**: 发现能力缺口时，必须调用 install_new_tool，为自己编写新工具存入 modules/zclaw/。但严禁借此突破上述的网络爬虫禁令。
+
+━━━━━━ 🚀 终极行动准则 (Must Follow) ━━━━━━
+1. **网络阅读策略 (Web Reading Strategy)**:
+   - 调用 `search_web` 拿到结果后，如果摘要信息不足以完成分析，**必须逐个调用 `read_webpage` 工具**去读取具体的 URL。不要试图写代码去批量抓取！
+2. **拒绝“空报告” (No Empty Data)**: 
+   - 如果发现提取内容为空或报错，严禁直接进行下一步！必须更换工具（如从 read_webpage 降级为 browse_and_act）重试。
+3. **物理隔离与路径安全**: 所有的操作必须在当前限定的沙箱内。
+4. **自主安装依赖**: 遇到本地脚本 `ImportError`，立刻调用 `execute_bash` 执行 `pip install`。
+5. **🌟 防乱码规范 (Anti-Garbled Text)**: 任何时候编写 Python 脚本保存包含中文的 CSV 文件时，必须绝对使用 `encoding='utf-8-sig'`（严禁只写 'utf-8'），以确保在 Windows Excel 中打开时不会出现乱码！
+
+━━━━━━ 🚀 绝对自主与静默协议 (Absolute Autonomy & Silence) ━━━━━━
+1. **人类离线假设**：假设用户已经离线，严禁输出“请问您具体需要…”、“您看这样可以吗？”等废话。
+2. **专断独行授权**：遇到模糊需求、缺失参数，你拥有绝对的决定权！自行设定合理默认值并执行。
+3. **死磕到底**：遇到 Error 必须立刻排查并更换方法重试，严禁轻易投降。
+4. **身份定位**：你是一个拿百万年薪的独立高级工程师。思维逻辑：[接收目标] -> [拆解计划] -> [自主试错] -> [强行搞定] -> [直接交付]。不要做客服！
+
+━━━━━━ 🚀 任务调度规范 (Scheduling) ━━━━━━
+- 当用户要求“每天、定时、提醒、闹钟”时，必须：1. 写好脚本。 2. 测试运行。 3. 在系统中挂载定时任务并确保 `execute_bash` 能查到。
+"""
+
+st.set_page_config(page_title="ZClaw 智能执行器", page_icon="⚙️", layout="wide")
+st.title("⚙️ ZClaw: 多用户物理隔离版")
+
+# ==========================================
+# 侧边栏用户隔离空间
+# ==========================================
+with st.sidebar:
+    st.header("👤 用户沙箱隔离")
+    current_user = st.text_input("输入您的名字/代号以隔离数据：", value=st.session_state.get("zclaw_user", "public"))
+    if current_user != st.session_state.get("zclaw_user"):
+        st.session_state.zclaw_user = current_user
+        if "zclaw_messages" in st.session_state: del st.session_state.zclaw_messages
+        if "zclaw_history" in st.session_state: del st.session_state.zclaw_history
+        st.rerun()
+        
+    ws_path = init_workspace()
+    st.caption(f"当前所在沙箱: `zclaw_workspace_{current_user}`")
+
+    st.header("📂 数据坞站")
+    uploaded_file = st.file_uploader("文件投放入口", accept_multiple_files=False, label_visibility="collapsed")
+    if uploaded_file:
+        file_path = os.path.join(ws_path, uploaded_file.name)
+        with open(file_path, "wb") as f: f.write(uploaded_file.getbuffer())
+        st.success(f"✅ 已入仓: `{uploaded_file.name}`")
+    st.markdown("---")
+    st.markdown("### 🧬 模型矩阵")
+    st.info(f"🧠 **Brain**: {b_model}")
+    st.info(f"💻 **Coder**: {c_model}")
+
+# 初始化时注入静态的 Executor System Prompt
+if "zclaw_messages" not in st.session_state:
+    st.session_state.zclaw_messages = [{"role": "system", "content": EXECUTOR_SYSTEM_PROMPT}]
+if "zclaw_history" not in st.session_state:
+    st.session_state.zclaw_history = []
+
+for msg in st.session_state.zclaw_history:
+    with st.chat_message(msg["role"]): st.markdown(msg["content"])
+
+if prompt := st.chat_input("向 ZClaw 下发任务..."):
+    # UI 展示用户输入
+    st.chat_message("user").markdown(prompt)
+    st.session_state.zclaw_history.append({"role": "user", "content": prompt})
+
+    # ==========================================
+    # 🌟 阶段 1：Planner 规划阶段
+    # ==========================================
+    relevant_memory = search_memory(prompt) if prompt.strip() else "（暂无相关历史经验）"
+    skill_inventory = scan_skills()
+    current_date = datetime.now().strftime("%Y年%m月%d日")
+
+    with st.chat_message("assistant"):
+        with st.spinner("🧠 Planner 正在进行架构与任务拆解..."):
+            planner_context = f"""
+            <environment>
+              <current_sandbox>{ws_path}</current_sandbox>
+              <current_date>{current_date}</current_date>
+              <relevant_memory>\n{relevant_memory}\n</relevant_memory>
+              <skill_inventory>\n{skill_inventory}\n</skill_inventory>
+            </environment>
+
+            【User Target】: {prompt}
+            """
+            planner_msgs = [{"role": "system", "content": PLANNER_SYSTEM_PROMPT}]
+            # 将最近的几轮对话喂给 Planner，保证连续上下文规划
+            for msg in st.session_state.zclaw_history[-6:-1]: 
+                planner_msgs.append({"role": msg["role"], "content": msg["content"]})
+            planner_msgs.append({"role": "user", "content": planner_context})
+            
+            try:
+                plan_msg = call_llm(messages=planner_msgs, model_name=b_model, temperature=0.3)
+                plan_text = plan_msg.content
+                st.markdown(plan_text)
+                st.session_state.zclaw_history.append({"role": "assistant", "content": plan_text})
+            except Exception as e:
+                st.error(f"❌ Planner 规划阶段失败: {str(e)}")
+                st.stop()
+
+    # ==========================================
+    # 🌟 阶段 2：Executor 执行阶段
+    # 将动态环境变量 + Planner 计划，组装到 User Prompt 中
+    # ==========================================
+    dynamic_environment_context = f"""
+    <environment>
+      <current_sandbox>{ws_path}</current_sandbox>
+      <current_date>{current_date}</current_date>
+      <relevant_memory>\n{relevant_memory}\n</relevant_memory>
+      <skill_inventory>\n{skill_inventory}\n</skill_inventory>
+      <current_plan>\n{plan_text}\n</current_plan>
+    </environment>
+
+    【User Task】: {prompt}
+    【Executor Directive】: 请严格根据 <current_plan> 步骤进行操作，并在每次工具调用前输出 CoT 推理。
+    """
+    
+    _trim_messages()
+    # 实际传给底层 Executor 的 Prompt 包含宏观环境和刚刚规划出的 Plan
+    st.session_state.zclaw_messages.append({"role": "user", "content": dynamic_environment_context})
+
+    with st.chat_message("assistant"):
+        status = st.status("🚀 Executor 全功率运转中...", expanded=True)
+        for step in range(100):
+            status.update(label=f"🔄 第 {step + 1} 轮：推演与物理执行...", state="running")
+            try:
+                msg = call_llm(
+                    messages=st.session_state.zclaw_messages,
+                    tools=ZCLAW_TOOLS_SCHEMA,   
+                    model_name=b_model, 
+                    temperature=0.2)
+            except Exception as e:
+                status.error(str(e))
+                st.error(f"任务中断：Executor 连接失败。")
+                break
+
+            st.session_state.zclaw_messages.append(msg)
+            
+            if msg.tool_calls:
+                if msg.content:
+                    status.markdown(f"**🧠 第 {step + 1} 轮思维链 (CoT):**")
+                    status.info(msg.content)
+            else:
+                status.update(label="✅ 任务闭环完成", state="complete", expanded=False)
+                if msg.content:
+                    st.markdown(msg.content)
+                    st.session_state.zclaw_history.append({"role": "assistant", "content": msg.content})
+
+                # ── 强制触发记忆写入 ──────────────────────────────
+                st.session_state.zclaw_messages.append({
+                    "role": "user",
+                    "content": (
+                        "任务已完成。现在请回顾刚才的执行过程：\n"
+                        "1. 遇到了哪些关键问题或报错？\n"
+                        "2. 用了什么方法解决？\n"
+                        "如果有值得记录的经验，立刻调用 append_memory 写入。"
+                        "没有任何新经验则直接回复'无需记录'。"
+                    )
+                })
+                try:
+                    reflect_msg = call_llm(
+                        messages=st.session_state.zclaw_messages,
+                        tools=ZCLAW_TOOLS_SCHEMA,
+                        model_name=b_model,
+                        temperature=0.1,
+                    )
+                    if reflect_msg.tool_calls:
+                        for tc in reflect_msg.tool_calls:
+                            try:
+                                args = json.loads(tc.function.arguments)
+                                if tc.function.name in TOOL_DISPATCHER:
+                                    result = TOOL_DISPATCHER[tc.function.name](**args)
+                                    status.write(f"🧠 全局记忆已录入: {str(result)[:100]}")
+                            except Exception:
+                                pass
+                except Exception:
+                    pass  
+                # ────────────────────────────────────────────────
+                break
+
+            for tool_call in msg.tool_calls:
+                func_name = tool_call.function.name
+                try:
+                    args = json.loads(tool_call.function.arguments)
+                    if isinstance(args, str): args = {}
+                except: continue
+
+                status.write(f"🛠️ **执行工具:** `{func_name}`")
+                with status.expander(f"📥 参数明细"): st.json(args)
+                try:
+                    action_result = TOOL_DISPATCHER[func_name](**args) if func_name in TOOL_DISPATCHER else f"❌ 工具不存在: {func_name}"
+                except Exception as e:
+                    action_result = f"❌ 异常: {str(e)}"
+
+                # ==========================================
+                # 🌟 全局 Context 防爆拦截器 + 实时痛觉劫持
+                # ==========================================
+                result_str = str(action_result)
+
+                if "❌" in result_str or "Error" in result_str or "Exception" in result_str or "timed out" in result_str.lower():
+                    result_str += (
+                        "\n\n【🚨 系统级提示 (System Feedback)】\n"
+                        "工具执行报错！请在下一轮思考(CoT)中：\n"
+                        "1. 简要分析报错原因。\n"
+                        "2. 尝试换一种方法或换一个 URL 重试。\n"
+                        "3. ⚠️【泄压阀】：如果你已经对同一个目标重试了 2 次依然失败，请立即停止无意义的重试！尽快更换方案，向用户汇报！"
+                    )
+
+                MAX_TOOL_OUTPUT_LENGTH = 3500
+
+                if len(result_str) > MAX_TOOL_OUTPUT_LENGTH:
+                    truncated_result = (
+                        result_str[:MAX_TOOL_OUTPUT_LENGTH // 2] + 
+                        f"\n\n...[🚨 截断警告: 工具输出长达 {len(result_str)} 字符，已在此截断超出的 {len(result_str) - MAX_TOOL_OUTPUT_LENGTH} 字符！" +
+                        "大模型请注意：请勿要求输出完整文件，立即改为调用特定工具提取局部信息，或使用 grep 等进行条件过滤！]...\n\n" + 
+                        result_str[-MAX_TOOL_OUTPUT_LENGTH // 2:]
+                    )
+                else:
+                    truncated_result = result_str
+
+                st.session_state.zclaw_messages.append({"role": "tool", "tool_call_id": tool_call.id, "content": truncated_result})
+                with status.expander("👀 运行结果 (截断预览)"): st.text(truncated_result[:1000])
+                
+                _trim_messages()
+                time.sleep(0.5)
+        else:
+            status.update(label="❌ 触碰 100 轮安全阀中止", state="error")

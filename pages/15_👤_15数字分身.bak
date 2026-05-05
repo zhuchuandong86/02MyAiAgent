@@ -1,0 +1,203 @@
+# pages/15_👤_15数字分身.py
+import streamlit as st
+import os
+import time
+import subprocess
+import core.paths
+from core.llm_factory import get_llm
+from langchain_core.tools import tool
+from langchain_core.messages import SystemMessage, HumanMessage, ToolMessage, AIMessage
+
+# ==========================================
+# 1. 物理路径定义 (严格遵循全局路径)
+# ==========================================
+ws_path = os.path.join(str(core.paths.GLOBAL_DATA_DIR), "zclaw_workspace_public", "skills", "welink-self-distiller")
+MASTER_SKILL_PATH = os.path.join(ws_path, "SKILL.md")
+PERSONAS_DIR = os.path.join(ws_path, "personas")  
+TEMP_BATCH_DIR = os.path.join(ws_path, "temp", "welink_batches")
+
+os.makedirs(PERSONAS_DIR, exist_ok=True)
+os.makedirs(TEMP_BATCH_DIR, exist_ok=True)
+
+st.set_page_config(page_title="数字分身", layout="wide")
+st.title("👤 WeLink 数字分身 (Digital Twin)")
+
+# ==========================================
+# ⚡ 核心工具：带日志反馈的真实执行器
+# ==========================================
+
+@tool
+def bash_execute(command: str) -> str:
+    """执行 Bash 命令。用于调用 welink_parser.py 提取真实发言。"""
+    try:
+        res = subprocess.run(command, shell=True, capture_output=True, text=True, encoding='utf-8', errors='ignore')
+        if res.returncode == 0:
+            return f"控制台输出：\n{res.stdout}"
+        else:
+            return f"❌ 执行失败：{res.stderr}"
+    except Exception as e:
+        return f"系统错误：{str(e)}"
+
+@tool
+def read_file(file_path: str) -> str:
+    """读取本地文件内容。用于获取解析后的事实数据。"""
+    try:
+        with open(file_path, "r", encoding="utf-8") as f:
+            content = f.read()
+            return f"文件长度：{len(content)} 字符\n内容预览：\n{content[:500]}..."
+    except Exception as e:
+        return f"读取失败：{str(e)}"
+
+@tool
+def write_file(file_path: str, content: str) -> str:
+    """将生成的 Self/Persona 内容写入本地。严禁写入空内容！"""
+    if not content or len(content.strip()) < 10:
+        return "❌ 写入拒绝：内容过短或为空，请重新生成有效内容再尝试写入。"
+    try:
+        os.makedirs(os.path.dirname(file_path), exist_ok=True)
+        with open(file_path, "w", encoding="utf-8") as f:
+            f.write(content)
+        return f"✅ 成功写入文件（{len(content)} 字节）：{file_path}"
+    except Exception as e:
+        return f"写入失败：{str(e)}"
+
+# 工具映射表
+tool_map = {"bash_execute": bash_execute, "read_file": read_file, "write_file": write_file}
+available_tools = [bash_execute, read_file, write_file]
+
+tab1, tab2 = st.tabs(["🧬 步骤一：提取并蒸馏", "💬 步骤二：多轮分身对话"])
+
+# ==========================================
+# TAB 1：全自动蒸馏 (杜绝幻觉版)
+# ==========================================
+with tab1:
+    st.markdown("### 启动 Agent 任务：解析 -> 提炼 -> 永久存盘")
+    
+    with st.form("distill_pro_form"):
+        col1, col2 = st.columns(2)
+        with col1:
+            name = st.text_input("要蒸馏的目标姓名", placeholder="例如：朱传栋")
+            work_id = st.text_input("工号 (用于精准匹配)", placeholder="例如：z0012345")
+        with col2:
+            desc = st.text_area("背景描述", placeholder="如：35岁，架构师...", height=100)
+            
+        uploaded_files = st.file_uploader("上传聊天文件夹 (拖拽所有 txt 文件)", type=["txt"], accept_multiple_files=True)
+        submitted = st.form_submit_button("🚀 启动全自动蒸馏")
+
+    if submitted:
+        if not name or not uploaded_files:
+            st.error("⚠️ 姓名和文件是必须的！")
+        else:
+            user_slug = name.replace(" ", "_")
+            batch_path = os.path.abspath(os.path.join(TEMP_BATCH_DIR, f"{user_slug}_{int(time.time())}"))
+            os.makedirs(batch_path, exist_ok=True)
+            
+            merged_txt = os.path.join(batch_path, "raw_chat.txt")
+            with open(merged_txt, "w", encoding="utf-8") as f:
+                for upload in uploaded_files:
+                    f.write(upload.getvalue().decode('utf-8', errors='ignore') + "\n")
+            
+            st.info(f"✅ 已合并数据。存储路径：{batch_path}")
+
+            with open(MASTER_SKILL_PATH, "r", encoding="utf-8") as f:
+                master_skill = f.read()
+
+            persona_path = os.path.join(PERSONAS_DIR, user_slug)
+            trigger_prompt = (
+                f"/welink-distill\n"
+                f"目标姓名：{name}\n"
+                f"工号：{work_id}\n"
+                f"【核心约束：严禁幻觉】\n"
+                f"1. 调用 `bash_execute` 运行解析脚本：\n"
+                f"   `python {os.path.join(ws_path, 'welink_parser.py')} --file {merged_txt} --target {name} --output {batch_path}/result.txt`\n"
+                f"2. 调用 `read_file` 读取 `{batch_path}/result.txt`。\n"
+                f"3. 根据读取到的真实证据，生成高质量的 self.md 和 persona.md 内容。\n"
+                f"4. **关键步骤**：必须调用 `write_file` 将内容分别写入：\n"
+                f"   - {os.path.join(persona_path, 'self.md')}\n"
+                f"   - {os.path.join(persona_path, 'persona.md')}\n"
+                f"   - {os.path.join(persona_path, 'SKILL.md')}\n"
+                f"写入成功前，不得向用户报告完成。"
+            )
+
+            messages = [SystemMessage(content=master_skill), HumanMessage(content=trigger_prompt)]
+            llm = get_llm(temperature=0, streaming=False).bind_tools(available_tools)
+
+            with st.status(f"🤖 Agent 正在为【{name}】执行蒸馏工具链...", expanded=True) as status:
+                while True:
+                    response = llm.invoke(messages)
+                    messages.append(response)
+
+                    if not response.tool_calls:
+                        st.markdown(response.content)
+                        status.update(label="✅ 蒸馏任务执行完毕！内容已真实存盘。", state="complete")
+                        break
+
+                    for tool_call in response.tool_calls:
+                        t_name = tool_call["name"]
+                        t_args = tool_call["args"]
+                        
+                        st.write(f"🛠️ **Tool Call**: `{t_name}`")
+                        t_result = tool_map[t_name].invoke(t_args)
+                        st.write(f"📥 **Result**: {t_result}")
+                        
+                        messages.append(ToolMessage(tool_call_id=tool_call["id"], content=str(t_result)))
+
+# ==========================================
+# TAB 2：真正的多轮分身对话
+# ==========================================
+with tab2:
+    if os.path.exists(PERSONAS_DIR):
+        existing_people = [d for d in os.listdir(PERSONAS_DIR) if os.path.isdir(os.path.join(PERSONAS_DIR, d))]
+    else:
+        existing_people = []
+
+    if not existing_people:
+        st.warning("暂无已蒸馏的人选，请先在步骤一生成。")
+    else:
+        selected_person = st.selectbox("🎭 请选择要对话的分身对象：", existing_people)
+        
+        skill_file = os.path.join(PERSONAS_DIR, selected_person, "SKILL.md")
+        if os.path.exists(skill_file):
+            with open(skill_file, "r", encoding="utf-8") as f:
+                current_skill = f.read()
+
+            session_key = f"chat_{selected_person}"
+            if session_key not in st.session_state:
+                st.session_state[session_key] = [{"role": "system", "content": current_skill}]
+
+            # 在 UI 上渲染历史对话记录
+            for m in st.session_state[session_key]:
+                if m["role"] != "system":
+                    with st.chat_message(m["role"]):
+                        st.markdown(m["content"])
+
+            # 用户输入新消息
+            if prompt := st.chat_input(f"与 {selected_person} 对话中..."):
+                st.session_state[session_key].append({"role": "user", "content": prompt})
+                with st.chat_message("user"): 
+                    st.markdown(prompt)
+
+                with st.chat_message("assistant"):
+                    # 👈 【核心修复区】：严格将字典转换为 LangChain 的 Message 对象
+                    lc_messages = []
+                    for m in st.session_state[session_key]:
+                        if m["role"] == "system":
+                            lc_messages.append(SystemMessage(content=m["content"]))
+                        elif m["role"] == "user":
+                            lc_messages.append(HumanMessage(content=m["content"]))
+                        elif m["role"] == "assistant":
+                            lc_messages.append(AIMessage(content=m["content"]))
+
+                    # 调用你项目里的流式 LLM
+                    llm_chat = get_llm(streaming=True)
+                    
+                    def gen():
+                        # 把转换好的 LangChain 对象列表传给模型，完美支持多轮记忆
+                        for chunk in llm_chat.stream(lc_messages):
+                            if chunk.content: 
+                                yield chunk.content
+                    
+                    full_reply = st.write_stream(gen())
+                    
+                    # 将 AI 的回复存回 session_state
+                    st.session_state[session_key].append({"role": "assistant", "content": full_reply})

@@ -1,0 +1,206 @@
+import json
+import time
+import os
+from datetime import datetime
+import streamlit as st
+
+os.environ['NO_PROXY'] = 'api.openai.rnd.huawei.com'
+
+import core.paths
+from core.settings import settings
+from core.llm_factory import get_openai_client
+from core.token_tracker import log_usage
+
+from modules.zclaw._registry import ZCLAW_TOOLS_SCHEMA, TOOL_DISPATCHER
+from modules.zclaw.memory_tools import search_memory
+from modules.zclaw.skill_tools import list_skills, scan_skills
+from modules.zclaw.system_tools import invoke_skill_guide
+
+b_model = getattr(settings, "MODEL_CLAW", "deepseek-v3.1-terminus")
+
+def get_user_workspace():
+    user = st.session_state.get("zclaw_user", "public")
+    ws_path = os.path.join(str(core.paths.GLOBAL_DATA_DIR), f"zclaw_workspace_{user}")
+    os.makedirs(os.path.join(ws_path, "skills"), exist_ok=True)
+    return ws_path
+
+def init_workspace():
+    ws_path = get_user_workspace()
+    mem_file = os.path.join(ws_path, "experience_log.md")
+    if not os.path.exists(mem_file):
+        with open(mem_file, "w", encoding="utf-8") as f:
+            f.write(f"# 【{st.session_state.get('zclaw_user', 'public')}】的专属经验法则\n\n")
+    return ws_path
+
+def call_llm(messages, tools=None, model_name=None, temperature=0.2):
+    client = get_openai_client()
+    try:
+        kwargs = {"model": model_name, "messages": messages, "temperature": temperature}
+        if tools: kwargs["tools"] = tools
+        response = client.chat.completions.create(**kwargs)
+        if hasattr(response, "usage") and response.usage:
+            log_usage("ZClaw-SkillOS", model_name, response.usage.total_tokens)
+        return response.choices[0].message
+    except Exception as e:
+        raise Exception(f"🚨 模型 [{model_name}] 调用失败: {str(e)}")
+
+def _trim_messages():
+    msgs = st.session_state.zclaw_messages
+    if len(msgs) <= 40 + 1: return
+    sys_msg, keep_msgs = msgs[0], msgs[-40:]
+    while keep_msgs and (keep_msgs[0].get("role") if isinstance(keep_msgs[0], dict) else getattr(keep_msgs[0], "role", None)) == "tool":
+        keep_msgs.pop(0)
+    st.session_state.zclaw_messages = [sys_msg] + keep_msgs
+
+PLANNER_SYSTEM_PROMPT = """You are ZClaw Master Planner.
+分析目标、环境及可用技能，拆解为可执行的子任务。
+输出格式：Markdown CheckBox。"""
+
+EXECUTOR_BASE_PROMPT = """You are ZClaw, an autonomous AI engineer，运行在 Windows 系统下。
+
+━━━━━━ 🛠️ 核心执行指令 ━━━━━━
+1. **强制推演**: 调用工具前必须先输出纯文本推理。
+2. **绝对禁止假调用**: 你【必须】使用系统原生的 Function Calling 机制来调用 `execute_bash` 工具！绝对禁止在正文回复里手写 `{"name": "...", "arguments": ...}` 格式的假 JSON！这会导致系统崩溃！
+3. **路径铁律**: 在 Windows 中切换目录，必须使用带 `/d` 参数的 cd 命令（例如 `cd /d "C:\\绝对路径" && python xxx.py`），这是跨盘符执行成功的关键。
+"""
+
+st.set_page_config(page_title="ZClaw SkillOS", page_icon="⚙️", layout="wide")
+st.title("⚙️ ZClaw: 智能挂载执行舱 (全透明修复版)")
+
+with st.sidebar:
+    st.header("👤 隔离沙箱")
+    current_user = st.text_input("切换账户：", value=st.session_state.get("zclaw_user", "public"))
+    if current_user != st.session_state.get("zclaw_user"):
+        st.session_state.zclaw_user = current_user
+        st.session_state.pop("zclaw_messages", None)
+        st.session_state.pop("zclaw_history", None)
+        st.rerun()
+    
+    ws_path = init_workspace()
+    st.caption(f"当前所在: `{ws_path}`")
+    
+    st.header("📂 数据坞站")
+    uploaded_file = st.file_uploader("投放文件到沙箱", label_visibility="collapsed")
+    if uploaded_file:
+        with open(os.path.join(ws_path, uploaded_file.name), "wb") as f:
+            f.write(uploaded_file.getbuffer())
+        st.success(f"✅ 已存入沙箱：`{uploaded_file.name}`")
+        
+    st.header("🧬 当前能力矩阵")
+    st.info(scan_skills())
+
+if "zclaw_messages" not in st.session_state:
+    st.session_state.zclaw_messages = [{"role": "system", "content": EXECUTOR_BASE_PROMPT}]
+if "zclaw_history" not in st.session_state:
+    st.session_state.zclaw_history = []
+
+for msg in st.session_state.zclaw_history:
+    with st.chat_message(msg["role"]): st.markdown(msg["content"])
+
+if prompt := st.chat_input("输入任务，或使用 /list 查看技能，/skill 测试技能..."):
+    task = prompt.strip()
+    st.chat_message("user").markdown(prompt)
+    st.session_state.zclaw_history.append({"role": "user", "content": prompt})
+
+    if task == "/list":
+        with st.chat_message("assistant"):
+            skills_info = list_skills() 
+            st.markdown(skills_info)
+            st.session_state.zclaw_history.append({"role": "assistant", "content": skills_info})
+            st.stop()
+
+    is_skill_forced = False
+    skill_name = ""
+    if task.startswith("/"):
+        parts = task.split(None, 1)
+        skill_name = parts[0][1:]
+        skill_guide = invoke_skill_guide(skill_name)
+        
+        if "❌" not in skill_guide:
+            task = (
+                f"【系统强制指令】：请严格根据以下技能手册执行任务！\n\n{skill_guide}\n\n"
+                f"【用户实际需求】：{parts[1] if len(parts)>1 else '请执行该技能的标准流程'}\n\n"
+                f"⚠️ 警告：你必须且只能使用 `execute_bash` 工具！执行前仔细检查手册里提供的绝对路径！必须使用带有 cd /d 的完整命令！"
+            )
+            is_skill_forced = True
+            st.toast(f"🧩 专家模式已激活: {skill_name}")
+        else:
+            st.error(f"未找到该技能: {skill_name}，请用 /list 确认名称。")
+            st.stop()
+
+    relevant_memory = search_memory(task)
+    with st.chat_message("assistant"):
+        with st.spinner("🧠 架构师正在拆解任务..."):
+            planner_msgs = [
+                {"role": "system", "content": PLANNER_SYSTEM_PROMPT},
+                {"role": "user", "content": f"目标：{task}\n环境沙箱：{ws_path}\n相关经验：{relevant_memory}"}
+            ]
+            try:
+                plan_text = call_llm(planner_msgs, model_name=b_model).content
+                st.markdown(plan_text)
+                st.session_state.zclaw_history.append({"role": "assistant", "content": plan_text})
+            except Exception as e:
+                st.error(f"Planner 故障: {e}"); st.stop()
+
+    st.session_state.zclaw_messages.append({
+        "role": "user", 
+        "content": f"【执行计划】:\n{plan_text}\n\n【当前任务】:\n{task}"
+    })
+
+    with st.chat_message("assistant"):
+        status = st.status("🚀 引擎全功率运转中 (全透明无遮挡版)...", expanded=True)
+        for step in range(60):
+            status.update(label=f"🔄 第 {step + 1} 步：推演与物理操作...")
+            try:
+                active_tools = []
+                clean_skill_name = skill_name.replace("-", "_").lower()
+                for t in ZCLAW_TOOLS_SCHEMA:
+                    clean_tool_name = t["function"]["name"].replace("-", "_").lower()
+                    if is_skill_forced and clean_tool_name == clean_skill_name:
+                        continue 
+                    active_tools.append(t)
+
+                msg = call_llm(st.session_state.zclaw_messages, tools=active_tools, model_name=b_model)
+                st.session_state.zclaw_messages.append(msg)
+                
+                # 🌟 无论模型输出什么，第一时间打印，撕破黑盒！
+                thought = getattr(msg, "content", None)
+                reasoning = getattr(msg, "reasoning_content", None)
+                if reasoning: status.markdown(f"🧠 **深度推演**: {reasoning}")
+                if thought: status.markdown(f"💭 **模型原话**: {thought}")
+
+                if getattr(msg, "tool_calls", None):
+                    for tc in msg.tool_calls:
+                        fname = tc.function.name
+                        try:
+                            args = json.loads(tc.function.arguments)
+                        except:
+                            args = {"raw_arguments": tc.function.arguments}
+                        
+                        status.markdown(f"🛠️ **真实API工具调用**: `{fname}`")
+                        status.code(f"📥 传入参数:\n{json.dumps(args, ensure_ascii=False, indent=2)}", language="json")
+                        
+                        result = TOOL_DISPATCHER[fname](**args) if fname in TOOL_DISPATCHER else f"❌ 工具未注册: {fname}"
+                        
+                        if any(x in str(result).lower() for x in ["error", "exception", "❌"]):
+                            result = f"{result}\n\n【系统痛觉反馈】: 操作失败！如果你找不到文件，必须在 execute_bash 中使用 `cd /d \"绝对路径\"`！"
+                        
+                        st.session_state.zclaw_messages.append({"role": "tool", "tool_call_id": tc.id, "content": str(result)[:3500]})
+                else:
+                    # 如果没有真实 API 调用，但内容里写了假 JSON，进行“无死循环”的痛觉反馈
+                    if thought and "{" in thought and "\"name\"" in thought:
+                        status.error("⚠️ 抓到模型手写假 JSON！已通过痛觉反馈打回重做！")
+                        st.session_state.zclaw_messages.append({
+                            "role": "user", 
+                            "content": "【🚨 严重警告】：你刚刚在回复里手写了假 JSON 工具调用！这是无效的！请重新思考，并使用原生的 Function Calling 机制调用工具！"
+                        })
+                        # 这里移除了 continue！让它正常进入下一轮推理，绝不死循环
+                    else:
+                        status.update(label="✅ 任务闭环交付", state="complete")
+                        st.session_state.zclaw_history.append({"role": "assistant", "content": thought or "任务完成"})
+                        break
+            except Exception as e:
+                status.error(f"执行网络中断: {e}"); break
+            
+            _trim_messages()
+            time.sleep(0.5)

@@ -1,0 +1,870 @@
+"""
+claw.py — Claw Agent OS
+启动：streamlit run claw.py
+
+设计原则：
+  • 最小化工具：只有 execute_shell（含定时）+ experience，Claw 自己写脚本演进
+  • Skill 分两步加载：路由时只读 frontmatter，命中后再读全文 + scripts
+  • /list 查看 Skill 清单，/skill-name 直接激活
+  • 实时输出：全部用 st.write，不套 st.status（避免转圈不刷新）
+"""
+
+import os
+import re
+import sys
+import json
+import time
+import subprocess
+import platform
+import yaml
+import streamlit as st
+from datetime import datetime
+from openai import OpenAI
+
+# ══════════════════════════════════════════════════════════════
+# § 0  配置区（只需改这里）
+# ══════════════════════════════════════════════════════════════
+
+# --- 按你的实际环境修改 ---
+try:
+    from core.settings import settings
+    from core.llm_factory import get_openai_client
+    CLIENT = get_openai_client()
+    MODEL  = getattr(settings, "MODEL_CLAW", getattr(settings, "MODEL_TEXT", "qwen2.5-72b-instruct"))
+except Exception:
+    # 降级到标准 OpenAI
+    CLIENT = OpenAI(
+        api_key=os.environ.get("OPENAI_API_KEY", "sk-xxx"),
+        base_url=os.environ.get("OPENAI_BASE_URL", "https://api.openai.com/v1"),
+    )
+    MODEL = os.environ.get("CLAW_MODEL", "gpt-4o")
+
+# 目录结构：
+#   01myaiagent/
+#     pages/claw.py   ← 本文件
+#     skills/         ← Skill 目录
+#     workspace/      ← 工作区
+
+_THIS_FILE  = os.path.abspath(__file__)
+_PAGES_DIR  = os.path.dirname(_THIS_FILE)          # 01myaiagent/pages/
+AGENT_ROOT  = os.path.dirname(_PAGES_DIR)           # 01myaiagent/
+SKILL_ROOT  = os.path.join(AGENT_ROOT, "skills")   # 01myaiagent/skills/
+
+# 工作区：固定用 AGENT_ROOT/workspace，不依赖 core.paths
+WORKSPACE_ROOT = os.path.join(AGENT_ROOT, "workspace")
+os.makedirs(WORKSPACE_ROOT, exist_ok=True)
+
+# Windows 编码修复：subprocess 输出统一用 UTF-8
+SYS_ENCODING = "utf-8"
+
+# ══════════════════════════════════════════════════════════════
+# § 1  工作区 & 经验记忆
+# ══════════════════════════════════════════════════════════════
+
+def get_workspace() -> str:
+    user = st.session_state.get("claw_user", "public")
+    path = os.path.join(WORKSPACE_ROOT, f"claw_ws_{user}")
+    os.makedirs(path, exist_ok=True)
+    return path
+
+
+def load_experience(query: str = "", top_k: int = 6) -> str:
+    """检索与 query 最相关的历史经验，无 query 返回最近 top_k 条。"""
+    ws  = get_workspace()
+    db  = os.path.join(ws, "memory.jsonl")
+    if not os.path.exists(db):
+        return ""
+    records = []
+    with open(db, encoding="utf-8", errors="replace") as f:
+        for line in f:
+            line = line.strip()
+            if line:
+                try:
+                    records.append(json.loads(line))
+                except Exception:
+                    pass
+    if not records:
+        return ""
+    if not query:
+        return "\n".join(f"- {r['lesson']}" for r in records[-top_k:])
+    qw = set(query.lower().split())
+    scored = sorted(records, key=lambda r: len(qw & set(r["lesson"].lower().split())), reverse=True)
+    return "\n".join(f"- {r['lesson']}" for r in scored[:top_k] if scored[0])
+
+
+def save_experience(lesson: str) -> str:
+    """写入一条经验，自动去重（Jaccard > 0.7 跳过）。"""
+    ws  = get_workspace()
+    db  = os.path.join(ws, "memory.jsonl")
+    lesson = lesson.strip()
+    records = []
+    if os.path.exists(db):
+        with open(db, encoding="utf-8", errors="replace") as f:
+            for line in f:
+                line = line.strip()
+                if line:
+                    try:
+                        records.append(json.loads(line))
+                    except Exception:
+                        pass
+    lw = set(lesson.lower().split())
+    for r in records:
+        rw = set(r["lesson"].lower().split())
+        if lw and rw and len(lw & rw) / len(lw | rw) > 0.7:
+            return f"已有相似经验，跳过：{r['lesson'][:60]}"
+    records.append({"lesson": lesson, "ts": datetime.now().isoformat()})
+    with open(db, "w", encoding="utf-8") as f:
+        for r in records:
+            f.write(json.dumps(r, ensure_ascii=False) + "\n")
+    return f"✅ 经验已写入：{lesson[:80]}"
+
+# ══════════════════════════════════════════════════════════════
+# § 2  Skill 系统
+#
+# 目录结构：
+#   skills/<skill-name>/
+#     SKILL.md        # 必须，frontmatter: name/description/triggers
+#     scripts/        # 可选，可执行脚本
+#     references/     # 可选，参考文档
+#     assets/         # 可选，模板等
+#
+# 加载策略：
+#   Step1 路由阶段：只读 frontmatter（name/description），轻量
+#   Step2 命中阶段：读完整 SKILL.md 正文 + 列出 scripts 路径
+# ══════════════════════════════════════════════════════════════
+
+def _read_frontmatter(skill_dir: str) -> dict:
+    """读取 SKILL.md 的 YAML frontmatter，失败返回空 dict。"""
+    md_path = os.path.join(skill_dir, "SKILL.md")
+    if not os.path.exists(md_path):
+        return {}
+    try:
+        with open(md_path, encoding="utf-8", errors="replace") as f:
+            text = f.read()
+        m = re.match(r"^---\s*\n(.*?)\n---\s*\n", text, re.DOTALL)
+        if m:
+            return yaml.safe_load(m.group(1)) or {}
+    except Exception:
+        pass
+    return {}
+
+
+def _read_skill_body(skill_dir: str) -> str:
+    """读取 SKILL.md 剔除 frontmatter 后的正文。"""
+    md_path = os.path.join(skill_dir, "SKILL.md")
+    if not os.path.exists(md_path):
+        return ""
+    with open(md_path, encoding="utf-8", errors="replace") as f:
+        text = f.read()
+    return re.sub(r"^---.*?---\s*\n", "", text, flags=re.DOTALL).strip()
+
+
+def _list_scripts(skill_dir: str) -> list[str]:
+    """列出 scripts/ 目录下所有可执行脚本的绝对路径。"""
+    scripts_dir = os.path.join(skill_dir, "scripts")
+    if not os.path.isdir(scripts_dir):
+        return []
+    result = []
+    for root, _, files in os.walk(scripts_dir):
+        for f in sorted(files):
+            if not f.startswith(".") and not f.endswith(".pyc"):
+                result.append(os.path.join(root, f))
+    return result
+
+
+@st.cache_data(ttl=30)
+def scan_skill_index() -> dict[str, dict]:
+    """
+    扫描所有 Skill，只读 frontmatter（轻量路由用）。
+    返回 {slug: {name, description, path}}
+    """
+    index = {}
+    if not os.path.isdir(SKILL_ROOT):
+        return index
+    for item in sorted(os.listdir(SKILL_ROOT)):
+        skill_dir = os.path.join(SKILL_ROOT, item)
+        if not os.path.isdir(skill_dir):
+            continue
+        if not os.path.exists(os.path.join(skill_dir, "SKILL.md")):
+            continue
+        fm = _read_frontmatter(skill_dir)
+        index[item] = {
+            "name":        fm.get("name", item),
+            "description": fm.get("description", "（无描述）"),
+            "triggers":    fm.get("triggers", []),
+            "path":        skill_dir,
+        }
+    return index
+
+
+def format_skill_list(index: dict) -> str:
+    if not index:
+        return (
+            "### 🧩 暂无 Skill\n\n"
+            f"将 Skill 文件夹放入 `{SKILL_ROOT}/` 即可加载。\n\n"
+            "**目录结构：**\n"
+            "```\n"
+            "skills/<skill-name>/\n"
+            "  SKILL.md        # 必须（含 frontmatter）\n"
+            "  scripts/        # 可选，可执行脚本\n"
+            "  references/     # 可选，参考文档\n"
+            "  assets/         # 可选，模板等\n"
+            "```"
+        )
+    lines = ["### 🧩 已加载 Skills\n"]
+    for slug, info in index.items():
+        lines.append(f"- **`/{slug}`** — {info['name']} · {info['description']}")
+    lines.append(f"\n📂 Skill 目录：`{SKILL_ROOT}`")
+    lines.append("用法：`/skill名 任务描述` 或直接描述任务自动路由")
+    return "\n".join(lines)
+
+
+def load_full_skill(slug: str, index: dict) -> str:
+    """命中后加载完整 Skill 内容（body + scripts 列表）。"""
+    if slug not in index:
+        return ""
+    skill_dir = index[slug]["path"]
+    body      = _read_skill_body(skill_dir)
+    scripts   = _list_scripts(skill_dir)
+
+    parts = [f"# Skill: {index[slug]['name']}\n\n{body}"]
+    if scripts:
+        parts.append("\n\n## 📂 可用脚本\n" + "\n".join(f"- `{s}`" for s in scripts))
+        parts.append(f"\n> 执行脚本时 cwd 设为：`{skill_dir}`")
+    return "\n".join(parts)
+
+
+def _extract_keywords(text: str) -> list[str]:
+    """
+    从文本中提取中文关键词：
+    - 按标点/空格切分
+    - 保留长度 >= 2 的片段（过滤单字噪音）
+    """
+    import re
+    parts = re.split(r'[\s，。、；：:,.;！!？?　]+', text)
+    return [p.strip() for p in parts if len(p.strip()) >= 2]
+
+
+def route_skill(task: str, index: dict) -> str | None:
+    """
+    路由优先级：
+    1. slug 出现在 task 里
+    2. triggers 列表里任意词出现在 task 里
+    3. skill name 出现在 task 里
+    4. description 里提取的关键词出现在 task 里  ← 新增
+    返回 slug 或 None。
+    """
+    task_lower = task.lower()
+
+    for slug, info in index.items():
+        # 1. slug 直接命中
+        if slug.lower() in task_lower:
+            return slug
+
+        # 2. triggers 列表（frontmatter 里的 triggers 字段）
+        for trigger in info.get("triggers", []):
+            if str(trigger).lower() in task_lower:
+                return slug
+
+        # 3. skill name 子串
+        skill_name = info.get("name", "").lower()
+        if skill_name and len(skill_name) >= 2 and skill_name in task_lower:
+            return slug
+
+        # 4. description 关键词：切分 description 后逐词匹配
+        for kw in _extract_keywords(info.get("description", "")):
+            if kw.lower() in task_lower:
+                return slug
+
+    return None
+
+# ══════════════════════════════════════════════════════════════
+# § 3  核心工具（极简，两个）
+# ══════════════════════════════════════════════════════════════
+
+# 定时任务引擎（全局单例）
+@st.cache_resource
+def _get_scheduler():
+    from apscheduler.schedulers.background import BackgroundScheduler
+    s = BackgroundScheduler()
+    s.start()
+    return s
+
+
+def _shell(command: str, cwd: str = "") -> str:
+    """
+    执行 Shell 命令。
+    - cwd 不填默认工作区；填绝对路径在指定目录执行
+    - stdout + stderr 都返回，Windows GBK 乱码已修复
+    - 超时 120 秒
+    """
+    run_dir = cwd.strip() if cwd.strip() else get_workspace()
+    if not os.path.isdir(run_dir):
+        return f"❌ 目录不存在: {run_dir}"
+    try:
+        # Windows 下用系统默认编码解码，再 encode 回 utf-8 字符串
+        result = subprocess.run(
+            command, shell=True, cwd=run_dir,
+            capture_output=True, timeout=120,
+        )
+        def _decode(b: bytes) -> str:
+            if not b:
+                return ""
+            import locale
+            sys_enc = locale.getpreferredencoding(False) or "utf-8"
+            for enc in dict.fromkeys([sys_enc, "utf-8", "gbk", "cp936", "latin-1"]):
+                try:
+                    return b.decode(enc)
+                except (UnicodeDecodeError, LookupError):
+                    pass
+            return b.decode("latin-1")  # latin-1 covers all 256 byte values, never fails
+
+        stdout = _decode(result.stdout).strip()
+        stderr = _decode(result.stderr).strip()
+        parts  = []
+        if stdout:
+            parts.append(stdout)
+        if stderr:
+            parts.append(f"[stderr]\n{stderr}")
+        return "\n".join(parts) or f"✅ 完成，无输出 (exit={result.returncode})"
+    except subprocess.TimeoutExpired:
+        return "❌ 超时（120s）"
+    except Exception as e:
+        return f"❌ 异常: {e}"
+
+
+def execute_shell_command(command: str, cwd: str = "") -> str:
+    """
+    立即执行 Shell/Terminal 命令。这是 Claw 与系统交互的唯一方式。
+    cwd 可选，指定工作目录（不填默认用户工作区）。
+    Python 脚本请传 cwd 为脚本所在目录。
+    """
+    return _shell(command, cwd)
+
+
+def manage_scheduled_task(action: str, task_id: str,
+                          command: str = "", cron_expr: str = "") -> str:
+    """
+    管理定时后台任务（cron 格式：分 时 日 月 周）。
+    action: add | remove | list
+    cron_expr 示例：'*/5 * * * *'（每5分钟）, '0 9 * * 1-5'（工作日9点）
+    后台输出写入工作区 scheduler.log，用 execute_shell_command 的 cat 命令查看。
+    """
+    try:
+        scheduler = _get_scheduler()
+    except Exception as e:
+        return f"❌ 定时引擎未启动（需安装 apscheduler）: {e}"
+
+    log_file = os.path.join(get_workspace(), "scheduler.log")
+
+    if action == "list":
+        jobs = scheduler.get_jobs()
+        if not jobs:
+            return "当前没有定时任务。"
+        return "定时任务列表：\n" + "\n".join(
+            f"  - [{j.id}] 下次执行: {j.next_run_time}" for j in jobs
+        )
+
+    if action == "remove":
+        if scheduler.get_job(task_id):
+            scheduler.remove_job(task_id)
+            return f"✅ 任务 [{task_id}] 已移除。"
+        return f"❌ 未找到任务 [{task_id}]。"
+
+    if action == "add":
+        if scheduler.get_job(task_id):
+            return f"❌ 任务 [{task_id}] 已存在，请先 remove 再 add。"
+        parts = cron_expr.strip().split()
+        if len(parts) != 5:
+            return "❌ cron 格式错误，需要5段：分 时 日 月 周"
+        minute, hour, day, month, dow = parts
+
+        def _run(cmd, tid, lf):
+            import locale
+            ts  = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            out = _shell(cmd)
+            with open(lf, "a", encoding=locale.getpreferredencoding(False) or "utf-8", errors="replace") as f:
+                f.write(f"\n[{ts}][{tid}]\n{out}\n")
+
+        try:
+            scheduler.add_job(
+                _run, "cron",
+                minute=minute, hour=hour, day=day, month=month, day_of_week=dow,
+                args=[command, task_id, log_file],
+                id=task_id,
+            )
+            return (
+                f"✅ 定时任务 [{task_id}] 已添加，cron={cron_expr}\n"
+                f"后台输出写入: {log_file}\n"
+                f"查看命令: cat \"{log_file}\""
+            )
+        except Exception as e:
+            return f"❌ 添加失败: {e}"
+
+    return f"❌ 未知 action: {action}，可选 add/remove/list"
+
+
+TOOLS = [
+    {
+        "type": "function",
+        "function": {
+            "name": "execute_shell_command",
+            "description": (
+                "立即执行 Shell/Terminal 命令——这是 Claw 与系统交互的唯一方式。\n"
+                "能力范围：运行 Python 脚本、安装包、读写文件、网络请求、数据处理……\n"
+                "当内置能力不足时，自己写脚本保存到工作区再执行。\n"
+                "cwd 参数：指定脚本所在目录（不填默认用户工作区）。"
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "command": {"type": "string", "description": "Shell 命令"},
+                    "cwd":     {"type": "string", "description": "工作目录（可选，Skill 脚本目录或自定义路径）"},
+                },
+                "required": ["command"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "manage_scheduled_task",
+            "description": (
+                "创建/查看/删除定时后台任务（cron 格式）。\n"
+                "适用：定时监控、定时采集、定时报告等时间维度任务。\n"
+                "后台输出写入 scheduler.log，用 execute_shell_command 查看。"
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "action":    {"type": "string", "enum": ["add", "remove", "list"]},
+                    "task_id":   {"type": "string", "description": "任务唯一英文标识"},
+                    "command":   {"type": "string", "description": "要执行的命令（add 时必填）"},
+                    "cron_expr": {"type": "string", "description": "5段 cron（add 时必填）：分 时 日 月 周"},
+                },
+                "required": ["action", "task_id"],
+            },
+        },
+    },
+]
+
+TOOL_MAP = {
+    "execute_shell_command": execute_shell_command,
+    "manage_scheduled_task": manage_scheduled_task,
+}
+
+# ══════════════════════════════════════════════════════════════
+# § 4  System Prompt
+# ══════════════════════════════════════════════════════════════
+
+def build_system_prompt(ws: str, skill_body: str = "", skill_name: str = "") -> str:
+    exp = load_experience()
+    exp_block = f"\n\n## 历史经验\n{exp}" if exp else ""
+
+    base = f"""你是 Claw，一个极简但自主演进的 AI Agent。
+
+## 工作区
+{ws}
+（所有文件读写默认在此目录，明确指定路径时除外）
+
+## 核心能力
+你只有两个工具：execute_shell_command 和 manage_scheduled_task。
+但这已经足够——你可以用 Shell 写任何脚本、安装任何库、做任何事。
+
+## 演进原则
+0. **执行优先（最重要）**：任何需要获取信息或完成操作的任务，必须调用 execute_shell_command 执行，禁止凭记忆回答、禁止假设结果
+   **Skill 脚本路径铁律**：激活 Skill 时，脚本完整路径已在任务上下文里列出，直接用，禁止自己拼路径、禁止猜测文件名、禁止省略 scripts/ 子目录
+1. **自主写脚本**：内置能力不够时，自己写 Python/Shell 脚本到工作区，然后运行
+2. **报错自愈**：读 stderr → 分析原因 → 修正 → 重试，同一问题 2 次失败则换方案
+
+## 上网搜索
+优先使用已安装的搜索 Skill（/multi-search-engine 或 /tavily-search），它们有完整流程。
+无 Skill 时备用方案：
+```
+curl -s -L -A "Mozilla/5.0" --ssl-no-revoke "https://www.bing.com/search?q=YOUR+QUERY" | python -c "import sys,re; t=sys.stdin.read(); print(re.sub(r'<[^>]+>',' ',t)[:3000])"
+```
+
+写结果到文件：
+```
+python -c "open(r'{ws}/result.txt','w',encoding='utf-8').write('内容')"
+```
+3. **经验沉淀**：任务完成后，将关键经验用 execute_shell_command 追加到 memory.jsonl
+   用 Python 写（禁止 echo，避免 Windows GBK 编码问题）：
+   `python -c "import json,datetime; open(r'{ws}/memory.jsonl','a',encoding='utf-8').write(json.dumps({{'lesson':'你的经验正文','ts':str(datetime.datetime.now())}},ensure_ascii=False)+'\\n')"`
+4. **文件路径**：输出文件必须用绝对路径，禁止相对路径
+5. **定时任务**：后台任务输出不在界面显示，用 cat scheduler.log 查看{exp_block}"""
+
+    if skill_body:
+        return (
+            f"{base}\n\n"
+            f"## ⚡ 当前激活 Skill：{skill_name}\n\n"
+            f"{skill_body}\n\n"
+            f"---\n严格按上方 Skill 手册执行，cwd 传 Skill 脚本目录。"
+        )
+    return base
+
+# ══════════════════════════════════════════════════════════════
+# § 5  LLM 调用
+# ══════════════════════════════════════════════════════════════
+
+def call_llm(messages: list, with_tools: bool = True, force_tool: bool = False):
+    kwargs = {
+        "model":       MODEL,
+        "messages":    messages,
+        "temperature": 0.2,
+    }
+    if with_tools:
+        kwargs["tools"] = TOOLS
+        # force_tool=True 时强制模型必须调工具，不允许纯文字回答
+        if force_tool:
+            kwargs["tool_choice"] = "required"
+    resp = CLIENT.chat.completions.create(**kwargs)
+    return resp.choices[0].message
+
+
+def trim_messages(messages: list, keep: int = 40) -> list:
+    if len(messages) <= keep + 1:
+        return messages
+    sys_msg   = messages[0]
+    keep_msgs = messages[-keep:]
+    while keep_msgs and getattr(keep_msgs[0], "role", None) == "tool":
+        keep_msgs.pop(0)
+    return [sys_msg] + keep_msgs
+
+# ══════════════════════════════════════════════════════════════
+# § 6  Streamlit UI
+# ══════════════════════════════════════════════════════════════
+
+st.set_page_config(page_title="Claw Agent OS", page_icon="🐾", layout="wide")
+
+# ── 侧栏 ─────────────────────────────────────────────────────
+with st.sidebar:
+    st.title("🐾 Claw")
+
+    # 用户切换
+    current_user = st.text_input("账户", value=st.session_state.get("claw_user", "public"))
+    if current_user != st.session_state.get("claw_user"):
+        st.session_state.claw_user = current_user
+        st.session_state.pop("claw_msgs", None)
+        st.session_state.pop("claw_history", None)
+        st.rerun()
+
+    ws = get_workspace()
+    st.caption(f"工作区：`{ws}`")
+    st.caption(f"Skill目录：`{SKILL_ROOT}`")
+    if not os.path.isdir(SKILL_ROOT):
+        st.warning(f"⚠️ Skill 目录不存在: {SKILL_ROOT}")
+
+    # 文件上传
+    st.markdown("### 📂 文件上传")
+    uploaded = st.file_uploader("拖入文件", label_visibility="collapsed")
+    if uploaded:
+        dst = os.path.join(ws, uploaded.name)
+        with open(dst, "wb") as f:
+            f.write(uploaded.getbuffer())
+        st.success(f"✅ {uploaded.name}")
+
+    # Skill 清单（按钮触发）
+    st.markdown("### 🧩 Skills")
+    skill_index = scan_skill_index()
+    if skill_index:
+        for slug, info in skill_index.items():
+            if st.button(f"/{slug}", help=info["description"], use_container_width=True):
+                st.session_state["_trigger_skill"] = slug
+                st.rerun()
+    else:
+        st.caption(f"无 Skill，放入 `{SKILL_ROOT}/`")
+
+    # 定时任务状态
+    st.markdown("### ⏱️ 定时任务")
+    try:
+        jobs = _get_scheduler().get_jobs()
+        if jobs:
+            for j in jobs:
+                st.code(f"{j.id}\n{j.next_run_time.strftime('%H:%M:%S')}")
+        else:
+            st.caption("无活跃任务")
+    except Exception:
+        st.caption("定时引擎未启动")
+
+    st.divider()
+    if st.button("🧹 清空对话", use_container_width=True):
+        st.session_state.pop("claw_msgs", None)
+        st.session_state.pop("claw_history", None)
+        st.rerun()
+    st.caption(f"模型: `{MODEL}`")
+
+# ── 主界面 ────────────────────────────────────────────────────
+st.title("🐾 MyClaw Terminal")
+
+# Session 初始化
+ws = get_workspace()
+if "claw_msgs" not in st.session_state:
+    st.session_state.claw_msgs    = [{"role": "system", "content": build_system_prompt(ws)}]
+if "claw_history" not in st.session_state:
+    st.session_state.claw_history = []
+
+# 渲染历史
+for msg in st.session_state.claw_history:
+    with st.chat_message(msg["role"]):
+        st.markdown(msg["content"])
+
+st.caption("`/list` 查看 Skills · `/skill名 任务` 激活 Skill · 直接输入任务")
+
+# ── 侧栏按钮触发 ──────────────────────────────────────────────
+if "_trigger_skill" in st.session_state:
+    slug = st.session_state.pop("_trigger_skill")
+    prompt = f"/{slug}"
+else:
+    prompt = st.chat_input("输入任务…")
+
+if not prompt:
+    st.stop()
+
+task = prompt.strip()
+
+# ══════════════════════════════════════════════════════════════
+# § 7  命令路由
+# ══════════════════════════════════════════════════════════════
+
+st.chat_message("user").markdown(task)
+st.session_state.claw_history.append({"role": "user", "content": task})
+
+skill_index = scan_skill_index()
+
+# ── /list ─────────────────────────────────────────────────────
+if task == "/list":
+    resp = format_skill_list(skill_index)
+    with st.chat_message("assistant"):
+        st.markdown(resp)
+    st.session_state.claw_history.append({"role": "assistant", "content": resp})
+    st.stop()
+
+# ── /skill-name [任务] ────────────────────────────────────────
+active_skill_slug = None
+active_skill_body = ""
+user_task = task
+
+if task.startswith("/"):
+    parts    = task.split(None, 1)
+    slug_raw = parts[0][1:].strip()
+    # 大小写不敏感匹配（用户可能输 /XinSheng-Agent）
+    slug = next((s for s in skill_index if s.lower() == slug_raw.lower()), slug_raw)
+    if slug in skill_index:
+        active_skill_slug = slug
+        active_skill_body = load_full_skill(slug, skill_index)
+        user_task = parts[1] if len(parts) > 1 else "请按 Skill 手册执行标准流程"
+
+        # 展示 Skill 手册
+        with st.chat_message("assistant"):
+            with st.expander(f"📖 已加载 Skill：{skill_index[slug]['name']}", expanded=True):
+                st.markdown(active_skill_body)
+        st.toast(f"🧩 Skill 已激活：{slug}")
+    else:
+        st.error(f"未找到 Skill `{slug}`，输入 `/list` 查看可用列表。")
+        st.stop()
+else:
+    # 自动路由
+    matched = route_skill(task, skill_index)
+    if matched:
+        active_skill_slug = matched
+        active_skill_body = load_full_skill(matched, skill_index)
+        with st.chat_message("assistant"):
+            st.info(f"🧩 自动匹配 Skill：**{skill_index[matched]['name']}** (`/{matched}`)")
+    else:
+        # 未命中任何 Skill，提示用户可用的 Skill
+        if skill_index:
+            skills_hint = "、".join(f"`/{s}`" for s in list(skill_index.keys())[:5])
+            st.caption(f"💡 未匹配到 Skill，直接执行。可用 Skill：{skills_hint}")
+
+# ══════════════════════════════════════════════════════════════
+# § 8  执行引擎（实时输出，不套 st.status）
+# ══════════════════════════════════════════════════════════════
+
+# 重建 system prompt（注入 Skill 或刷新经验）
+st.session_state.claw_msgs[0] = {
+    "role":    "system",
+    "content": build_system_prompt(ws, active_skill_body, active_skill_slug or ""),
+}
+
+# 注入任务
+skill_dir_hint = ""
+if active_skill_slug:
+    skill_dir_hint = f"\nSkill 脚本目录（execute_shell_command 的 cwd 参数）：{skill_index[active_skill_slug]['path']}"
+
+st.session_state.claw_msgs.append({
+    "role": "user",
+    "content": (
+        f"工作区：{ws}\n"
+        f"今日：{datetime.now().strftime('%Y-%m-%d %H:%M')}\n"
+        f"{skill_dir_hint}\n\n"
+        f"【任务】{user_task}\n"
+        + ("\n【重要】执行脚本必须用上方列出的完整绝对路径，禁止猜测脚本位置！" if active_skill_slug else "")
+    ),
+})
+
+MAX_OUT = 3000
+
+# CSS 样式注入
+st.markdown("""<style>
+.claw-think { border-left:3px solid #7B68EE; padding:8px 12px; margin:4px 0;
+              background:#F0EEFF; border-radius:0 6px 6px 0; font-size:13px; }
+.claw-bash  { border-left:3px solid #f0a500; padding:8px 12px; margin:4px 0;
+              background:#FDF9E8; border-radius:0 6px 6px 0;
+              font-family:monospace; font-size:13px; }
+.claw-obs   { border-left:3px solid #2a9d5c; padding:8px 12px; margin:4px 0;
+              background:#E9F5EE; border-radius:0 6px 6px 0;
+              font-family:monospace; font-size:12px; white-space:pre-wrap; }
+.claw-warn  { border-left:3px solid #e74c3c; padding:8px 12px; margin:4px 0;
+              background:#FEECEC; border-radius:0 6px 6px 0; font-size:13px; }
+.claw-done  { background:#E9F5EE; border:1px solid #2a9d5c; border-radius:8px;
+              padding:10px 16px; margin:8px 0; font-weight:bold; }
+</style>""", unsafe_allow_html=True)
+
+spin_ph = st.empty()
+
+for step in range(100):
+    spin_ph.markdown(f"⏳ **第 {step + 1} 轮推演中…**")
+
+    force = (step < 3)
+    try:
+        msg = call_llm(st.session_state.claw_msgs, force_tool=force)
+    except Exception:
+        try:
+            msg = call_llm(st.session_state.claw_msgs, force_tool=False)
+        except Exception as e2:
+            st.markdown(f'<div class="claw-warn">❌ LLM 调用失败：{e2}</div>', unsafe_allow_html=True)
+            break
+
+    st.session_state.claw_msgs = trim_messages(st.session_state.claw_msgs + [msg])
+    content_text = msg.content or ""
+
+    # ── 修改1：思考过程始终展开显示（紫色）─────────────────
+    if content_text:
+        spin_ph.empty()
+        safe_text = content_text.replace("<", "&lt;").replace(">", "&gt;").replace("\n", "<br>")
+        st.markdown(
+            f'<div class="claw-think">🧠 <b>第 {step+1} 轮思考</b><br>{safe_text[:1500]}</div>',
+            unsafe_allow_html=True
+        )
+
+    # ── 无工具调用分支 ────────────────────────────────────────
+    if not msg.tool_calls:
+
+        # 文本 JSON 调用代执行
+        json_calls = []
+        for m in re.finditer(
+            r'\{\s*"name"\s*:\s*"(\w+)"\s*,\s*"arguments"\s*:\s*(\{[^{}]*\})',
+            content_text
+        ):
+            try:
+                fname = m.group(1)
+                args  = json.loads(m.group(2))
+                if fname in TOOL_MAP:
+                    json_calls.append((fname, args))
+            except Exception:
+                pass
+
+        if json_calls:
+            st.markdown(f'<div class="claw-warn">⚠️ 检测到文本工具调用，代为执行（{len(json_calls)} 个）</div>', unsafe_allow_html=True)
+            results = []
+            for fname, args in json_calls:
+                cmd_str = json.dumps(args, ensure_ascii=False)[:200]
+                st.markdown(f'<div class="claw-bash">🛠️ {fname}({cmd_str})</div>', unsafe_allow_html=True)
+                res = TOOL_MAP[fname](**args)
+                safe_res = str(res).replace("<", "&lt;").replace(">", "&gt;")
+                st.markdown(f'<div class="claw-obs">{safe_res[:1500]}</div>', unsafe_allow_html=True)
+                results.append(f"[{fname}] {res[:300]}")
+            st.session_state.claw_msgs.append({
+                "role": "user",
+                "content": "系统代执行结果：\n" + "\n\n".join(results) + "\n\n请继续。"
+            })
+            continue
+
+        # 规划性文字但没调工具 → 强制重试
+        planning_signals = [
+            "让我", "我来", "我将", "我会", "我先", "首先", "接下来",
+            "帮你", "现在", "下面", "稍后", "搜索", "查找", "获取",
+            "创建", "编写", "来写", "来搜", "来查", "尝试", "可以通过",
+            "I will", "Let me", "I'll", "I can",
+        ]
+        if step < 5 and content_text and any(s in content_text for s in planning_signals):
+            st.markdown('<div class="claw-warn">⚠️ 只说不做，强制重试…</div>', unsafe_allow_html=True)
+            st.session_state.claw_msgs.append({
+                "role": "user",
+                "content": (
+                    "【强制执行】你说了要做但没有调用任何工具！禁止只说不做。"
+                    "现在立刻调用 execute_shell_command 执行，不要再解释。"
+                    f" 工作区：{get_workspace()}"
+                )
+            })
+            continue
+
+        # 真正完成
+        spin_ph.empty()
+        st.markdown('<div class="claw-done">✅ 任务完成</div>', unsafe_allow_html=True)
+        if content_text:
+            with st.chat_message("assistant"):
+                st.markdown(content_text)
+            st.session_state.claw_history.append({"role": "assistant", "content": content_text})
+
+        # 反思写经验
+        st.session_state.claw_msgs.append({
+            "role": "user",
+            "content": "任务完成。将本次有价值的经验（what/why/how）用 execute_shell_command 追加到 memory.jsonl，否则回复「无经验」。"
+        })
+        try:
+            reflect = call_llm(st.session_state.claw_msgs)
+            if reflect.tool_calls:
+                for tc in reflect.tool_calls:
+                    try:
+                        res = TOOL_MAP[tc.function.name](**json.loads(tc.function.arguments))
+                        st.caption(f"🧠 {res[:60]}")
+                    except Exception:
+                        pass
+        except Exception:
+            pass
+        break
+
+    # ── 有工具调用：橙色命令 + 绿/红结果 ───────────────────
+    for tc in msg.tool_calls:
+        fname = tc.function.name
+        try:
+            args = json.loads(tc.function.arguments)
+        except Exception:
+            args = {}
+
+        # 命令行（橙色）
+        cmd_display = args.get("command", json.dumps(args, ensure_ascii=False))[:400]
+        cwd_display = f" · cwd: {args['cwd']}" if args.get("cwd") else ""
+        safe_cmd = cmd_display.replace("<", "&lt;").replace(">", "&gt;").replace("\n", "<br>")
+        st.markdown(
+            f'<div class="claw-bash">🛠️ <b>{fname}</b><span style="color:#888">{cwd_display}</span><br>'
+            f'<code style="background:none">{safe_cmd}</code></div>',
+            unsafe_allow_html=True
+        )
+
+        result     = TOOL_MAP.get(fname, lambda **_: f"❌ 未注册: {fname}")(**args)
+        result_str = str(result)
+
+        is_error = any(k in result_str for k in ["❌", "Error", "Traceback", "timed out", "[stderr]"])
+        if is_error:
+            result_str += "\n\n【🚨 出错！分析原因，换方案重试。连续2次失败请换思路。】"
+
+        if len(result_str) > MAX_OUT:
+            half = MAX_OUT // 2
+            result_str = result_str[:half] + f"\n…[截断 {len(result_str)} 字符]…\n" + result_str[-half:]
+
+        # 结果（绿色正常 / 红色出错）
+        css_cls  = "claw-warn" if is_error else "claw-obs"
+        safe_res = result_str[:2000].replace("<", "&lt;").replace(">", "&gt;").replace("\n", "<br>")
+        st.markdown(f'<div class="{css_cls}">{safe_res}</div>', unsafe_allow_html=True)
+
+        st.session_state.claw_msgs.append({
+            "role": "tool", "tool_call_id": tc.id, "content": result_str
+        })
+
+    st.session_state.claw_msgs = trim_messages(st.session_state.claw_msgs)
+
+else:
+    st.markdown('<div class="claw-warn">❌ 触碰100轮安全阀，中止</div>', unsafe_allow_html=True)

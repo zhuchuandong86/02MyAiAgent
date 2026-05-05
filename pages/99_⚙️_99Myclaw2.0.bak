@@ -1,0 +1,646 @@
+# claw.py  ── Claw Agent (Streamlit)
+# 启动: pip install streamlit openai && API_KEY=xxx streamlit run claw.py
+
+import os, re, json, subprocess, time
+from datetime import datetime
+import streamlit as st
+from openai import OpenAI
+from core.settings import settings
+# 🌟 接入你的底层计费系统
+from core.token_tracker import log_usage
+import urllib
+import ssl
+
+ssl._create_default_https_context = ssl._create_unverified_context
+
+os.environ['NO_PROXY'] = settings.INTERNAL_URL or ""
+PROXY_HOST = getattr(settings, "PROXY_HOST", os.getenv("PROXY_HOST"))
+PROXY_USER = getattr(settings, "PROXY_USER", os.getenv("PROXY_USER"))
+PROXY_PASS = getattr(settings, "PROXY_PASS", os.getenv("PROXY_PASS"))
+PROXIES_DICT = None
+PROXY_URL    = None
+
+if PROXY_HOST:
+    if PROXY_USER and PROXY_PASS:
+        pu = urllib.parse.quote(PROXY_USER, safe="")
+        pp = urllib.parse.quote(PROXY_PASS, safe="")
+        PROXY_URL = f"http://{pu}:{pp}@{PROXY_HOST.replace('http://', '')}"
+    else:
+        PROXY_URL = f"http://{PROXY_HOST.replace('http://', '')}"
+    PROXIES_DICT = {"http": PROXY_URL, "https": PROXY_URL}
+    
+    # 🌟 核心：必须反向注入到系统环境，Browser-use 才能连上网！
+    os.environ["HTTP_PROXY"] = PROXY_URL
+    os.environ["HTTPS_PROXY"] = PROXY_URL
+
+
+
+# ─────────────────────────────────────────
+# 页面
+# ─────────────────────────────────────────
+st.set_page_config(page_title="Claw Agent", page_icon="🦞", layout="wide")
+st.markdown("""
+<style>
+.step-bash  { border-left:3px solid #f0a500; padding:8px 12px; margin:4px 0;
+              background:#FDF9E8; border-radius:0 6px 6px 0; font-family:monospace; font-size:13px; }
+.step-obs   { border-left:3px solid #2a9d5c; padding:8px 12px; margin:4px 0;
+              background:#E9F5EE; border-radius:0 6px 6px 0; font-family:monospace; font-size:12px;
+              white-space:pre-wrap; }
+.step-skill { border-left:3px solid #b06af0; padding:8px 12px; margin:4px 0;
+              background:#E8EDF5; border-radius:0 6px 6px 0; }
+.done-badge { background:#F1ECF7; border:1px solid #2a9d5c; border-radius:8px;
+              padding:10px 16px; margin:8px 0; }
+</style>""", unsafe_allow_html=True)
+
+# ─────────────────────────────────────────
+# 常量
+# ─────────────────────────────────────────
+MAX_HISTORY = 30    # 保留的最大对话轮数
+MAX_OUTPUT  = 3000  # bash 输出最大字符数
+ 
+# ─────────────────────────────────────────
+# Skill 操作
+# 核心原则：description 只读 frontmatter（轻量路由）
+#           body 只在命中后才读（按需加载）
+# ─────────────────────────────────────────
+def scan_skills(root: str) -> dict[str, str]:
+    """扫描所有 skill，只读 frontmatter 的 description，不读正文"""
+    meta = {}
+    if not os.path.exists(root):
+        return meta
+    try:
+        entries = sorted(os.listdir(root))
+    except PermissionError:
+        return meta
+    for name in entries:
+        skill_dir = os.path.join(root, name)
+        path      = os.path.join(skill_dir, "SKILL.md")
+        try:
+            if not os.path.isdir(skill_dir) or not os.path.exists(path):
+                continue
+            with open(path, encoding="utf-8",errors="ignore") as f:
+                head = "".join(f.readline() for _ in range(20))
+        except (PermissionError, OSError):
+            continue
+        m = re.search(r'^description:\s*["\'\']?(.+?)["\'\']?\s*$', head, re.MULTILINE)
+        if m:
+            meta[name] = m.group(1).strip()
+    return meta
+ 
+def load_skill_body(skill_name: str, skill_root: str) -> str:
+    """命中后才读完整 SKILL.md，剔除 frontmatter"""
+    path = os.path.join(skill_root, skill_name, "SKILL.md")
+    if not os.path.exists(path):
+        return ""
+    content = open(path, encoding="utf-8",errors="ignore").read()
+    # 去掉 --- frontmatter ---
+    return re.sub(r'^---.*?---\s*', '', content, flags=re.DOTALL).strip()
+ 
+def route_skill(task: str, meta: dict, client: OpenAI, model: str) -> str | None:
+    """用 LLM 从 description 列表里选最匹配的 skill，无匹配返回 None"""
+    if not meta:
+        return None
+    meta_str = "\n".join(f"- {k}: {v}" for k, v in meta.items())
+    try:
+        resp = client.chat.completions.create(
+            model=model, temperature=0, timeout=30,
+            messages=[{"role": "user", "content":
+                f"从以下 skills 里选出最适合任务的一个，只返回名称，无匹配返回 NONE。\n\n"
+                f"{meta_str}\n\n任务：{task}"}],
+        )
+        name = resp.choices[0].message.content.strip()
+        return name if name in meta else None
+    except Exception:
+        return None
+ 
+# ─────────────────────────────────────────
+# 记忆
+# ─────────────────────────────────────────
+def read_memory(workspace: str) -> str:
+    path = os.path.join(workspace, "experience_log.md")
+    if not os.path.exists(path):
+        return "（暂无历史经验）"
+    return open(path, encoding="utf-8",errors="ignore").read()[-3000:]
+ 
+# ─────────────────────────────────────────
+# 防爆
+# ─────────────────────────────────────────
+def trim_history(history: list) -> list:
+    if len(history) <= MAX_HISTORY:
+        return history
+    return [history[0]] + history[-(MAX_HISTORY - 1):]
+ 
+def truncate_obs(obs: str) -> str:
+    if len(obs) <= MAX_OUTPUT:
+        return obs
+    half = MAX_OUTPUT // 2
+    return (obs[:half]
+            + f"\n\n…[截断 {len(obs)-MAX_OUTPUT} 字符]…\n\n"
+            + obs[-half:])
+ 
+# ─────────────────────────────────────────
+# bash 执行
+# ─────────────────────────────────────────
+def run_bash(cmd: str, timeout: int = 60) -> str:
+    try:
+        r = subprocess.run(
+            cmd, shell=True, capture_output=True, text=True, timeout=timeout,encoding='utf-8', errors='replace',
+            env={**os.environ, "PYTHONUNBUFFERED": "1"},
+        )
+        out = r.stdout.strip()
+        err = r.stderr.strip()
+        return "\n".join(filter(None, [out, f"[stderr]\n{err}" if err else ""])) or "(no output)"
+    except subprocess.TimeoutExpired:
+        return f"[timeout after {timeout}s]"
+    except Exception as e:
+        return f"[error] {e}"
+ 
+# ─────────────────────────────────────────
+# LLM 调用（流式 + 限流重试）
+# ─────────────────────────────────────────
+# ─────────────────────────────────────────
+# LLM 调用（流式 + 限流重试 + 🌟后台静默计费）
+# ─────────────────────────────────────────
+def call_llm(client: OpenAI, model: str, messages: list,
+             stream_placeholder=None, max_retries: int = 3) -> str:
+    for attempt in range(max_retries):
+        try:
+            if stream_placeholder is not None:
+                # 流式：实时显示文字
+                stream = client.chat.completions.create(
+                    model=model, messages=messages,
+                    temperature=0.3, stream=True, timeout=60,
+                    stream_options={"include_usage": True} # 🌟 开启流式 Token 捕获
+                )
+                collected = []
+                for chunk in stream:
+                    # 提取文字
+                    if len(chunk.choices) > 0:
+                        delta = chunk.choices[0].delta.content or ""
+                        collected.append(delta)
+                        stream_placeholder.caption("🤔 " + "".join(collected)[-400:])
+                    
+                    # 🌟 捕获最后一块的 usage 数据，直接打入你的计费大盘！
+                    if hasattr(chunk, 'usage') and chunk.usage:
+                        log_usage("ZClaw-2.0极简版", model, chunk.usage.total_tokens)
+
+                stream_placeholder.empty()
+                return "".join(collected).strip()
+            else:
+                # 非流式：用于 Planner/反思等轻量调用
+                resp = client.chat.completions.create(
+                    model=model, messages=messages,
+                    temperature=0.2, timeout=60,
+                )
+                
+                # 🌟 捕获非流式的 usage 数据，打入计费大盘！
+                if hasattr(resp, 'usage') and resp.usage:
+                    log_usage("ZClaw-2.0极简版", model, resp.usage.total_tokens)
+                    
+                return resp.choices[0].message.content.strip()
+                
+        except Exception as e:
+            err = str(e)
+            if any(c in err for c in ["420", "429", "rate", "Rate"]):
+                wait = 2 ** attempt
+                if stream_placeholder:
+                    stream_placeholder.caption(f"⏳ 限流，{wait}s 后重试…")
+                time.sleep(wait)
+                continue
+            if stream_placeholder:
+                stream_placeholder.empty()
+            raise
+    raise RuntimeError(f"重试 {max_retries} 次后仍限流")
+ 
+# ─────────────────────────────────────────
+# System Prompt 构建
+#
+# 关键设计：
+#   有 skill → skill body 就是主指令，executor 直接遵照执行
+#   无 skill → executor 用通用指令，配合 planner 给的计划
+# ─────────────────────────────────────────
+EXECUTOR_BASE = """你是 Claw，一个自主解决问题的 Agent。
+ 
+# 唯一工具：bash
+能做一切：shell命令、Python脚本、读写文件、pip安装、网络请求。
+ 
+# 系统环境
+- 操作系统：{os_name}
+- 文件列出：{ls_cmd}（禁止使用 ls，会报错）
+- 路径分隔：{sep}
+ 
+# 输出格式（每步只输出一个 JSON，禁止附加任何文字）
+{{"type": "bash",  "think": "推理过程", "cmd": "命令"}}
+{{"type": "ask",   "think": "为何需要问", "question": "问题"}}
+{{"type": "done",  "think": "完成原因",  "summary": "结果摘要"}}
+ 
+# 执行原则
+1. think 先写推理再行动
+2. 报错时：读 stderr → 分析 → 修正重试，不要重复相同命令
+3. 能自己解决就不问用户
+4. 任务完成后，把有价值的经验追加到 {workspace}/experience_log.md
+"""
+ 
+PLANNER_PROMPT = """你是 Claw Planner，把用户任务拆解为清晰的执行步骤。
+ 
+输出格式（仅此格式，不说废话）：
+### 📋 执行计划
+1. [ ] **步骤名**：具体说明
+2. [ ] ...
+"""
+ 
+def build_system(skill_body: str, memory: str, workspace: str, skill_root: str, skill_dir: str = "") -> str:
+    import platform
+    is_win  = platform.system() == "Windows"
+    os_name = platform.system()
+    ls_cmd  = "dir" if is_win else "ls -la"
+    today   = datetime.now().strftime("%Y-%m-%d")
+ 
+    # ── 工具格式（所有模式都需要）──
+    # 改成（加网络能力说明）
+    tool_fmt = f"""你是 Claw Agent。
+
+# OS: {os_name} — {"用 dir 列目录，禁止用 ls" if is_win else "用 ls -la 列目录"}
+# 工作目录: {workspace}
+
+# 输出格式（每步只输出一个 JSON，不附加任何文字）
+{{"type": "bash",  "think": "推理", "cmd": "命令"}}
+{{"type": "ask",   "think": "原因", "question": "问题"}}
+{{"type": "done",  "think": "原因", "summary": "摘要"}}
+
+# 原则
+- 报错时读 stderr → 分析 → 修正重试
+- 能自己解决就不问用户
+- 完成后把有价值经验写入 {workspace}/experience_log.md
+
+# 网络能力（直接用 Python，无需问用户授权）
+搜索新闻示例：
+  python -c "import urllib.request,urllib.parse,json; q=urllib.parse.quote('南非MTN新闻'); r=urllib.request.urlopen('https://news.google.com/rss/search?q='+q+'&hl=zh-CN'); print(r.read().decode()[:3000])"
+抓取网页示例：
+  python -c "import urllib.request; print(urllib.request.urlopen('https://example.com').read().decode('utf-8','ignore')[:3000])"
+pip 安装后用 requests：
+  pip install requests -q && python -c "import requests; print(requests.get('https://...').text[:3000])"
+"""
+ 
+    if skill_body:
+        # ★ Skill 模式：skill dir 是工作根，直接进去执行，不探测 workspace
+        sd = skill_dir or skill_root
+        os_hint = "Windows：用 dir 列文件，用反斜杠路径" if __import__("platform").system() == "Windows" else "Linux/Mac：用 ls -la"
+        return f"""# ⚡ Skill 激活：{sd}
+
+{skill_body}
+
+---
+# 执行工具约束
+- OS：{__import__("platform").system()}（{os_hint}）
+- Skill 目录（所有支持文件都在这里）：{sd}
+- 第一步必须先 cd 进入 Skill 目录：cd "{sd}"
+- 之后用相对路径或绝对路径执行 Skill 里的脚本
+- 输出格式（每步只输出一个 JSON，不附加任何文字）：
+  {{"type": "bash",  "think": "推理", "cmd": "命令"}}
+  {{"type": "ask",   "think": "原因", "question": "问题"}}
+  {{"type": "done",  "think": "原因", "summary": "摘要"}}
+- 报错时读 stderr → 分析 → 修正重试
+- 完成后把有价值经验写入 {workspace}/experience_log.md
+"""
+ 
+    else:
+        # 无 Skill：通用模式，附加环境信息和记忆
+        ws_files  = sorted(os.listdir(workspace)) if os.path.exists(workspace) else []
+        file_list = "\n".join(f"  - {f}" for f in ws_files) or "  （空）"
+        return f"""{tool_fmt}
+# 环境
+- 今天：{today}
+- 已有文件：
+{file_list}
+ 
+# 历史经验
+{memory}
+"""
+ 
+def render_assistant(msg: dict):
+    if msg.get("skill"):
+        st.markdown(f'<div class="step-skill">🧩 Skill: <b>{msg["skill"]}</b></div>',
+                    unsafe_allow_html=True)
+    if msg.get("plan"):
+        with st.expander("📋 执行计划", expanded=False):
+            st.markdown(msg["plan"])
+    for step in msg.get("steps", []):
+        t = step["type"]
+        if t == "bash":
+            st.markdown(
+                f'<div class="step-bash">💭 {step.get("think","")}<br>'
+                f'<b>$ {step.get("cmd","")}</b></div>',
+                unsafe_allow_html=True)
+            obs = step.get("obs", "")
+            if obs:
+                st.markdown(
+                    f'<div class="step-obs">→ {obs[:600]}{"…" if len(obs)>600 else ""}</div>',
+                    unsafe_allow_html=True)
+        elif t == "ask":
+            st.markdown(f'❓ **{step["question"]}**')
+        elif t == "done":
+            st.markdown(f'<div class="done-badge">✅ {step["summary"]}</div>',
+                        unsafe_allow_html=True)
+    if msg.get("text"):
+        st.markdown(msg["text"])
+
+
+
+
+# ─────────────────────────────────────────
+# 侧栏
+# ─────────────────────────────────────────
+with st.sidebar:
+    st.title("🦞 Claw")
+
+    st.subheader("模型")
+    api_key    = settings.API_KEY
+    base_url   = settings.API_BASE
+    model_name = settings.MODEL_CLAW
+    max_steps  = st.slider("最大执行步数", 5, 60, 30)
+
+    st.divider()
+    st.subheader("🧩 Skills")
+    skill_root  = st.text_input("Skill 目录", value=os.environ.get("SKILL_ROOT", "skills"))
+    skills_meta = scan_skills(skill_root)
+ 
+    # if skills_meta:
+    #     for k, v in skills_meta.items():
+    #         st.markdown(f"**/{k}**  \n<small>{v[:60]}{'…' if len(v)>60 else ''}</small>",
+    #                     unsafe_allow_html=True)
+    # else:
+    #     st.caption("未找到 skill，将 SKILL.md 放入 skills/<name>/ 目录即可")
+ 
+    if st.button("🔄 刷新"):
+        st.rerun()
+ 
+    st.divider()
+    st.subheader("📂 文件")
+    workspace = st.text_input("工作目录", value=os.environ.get("WORKSPACE", "workspace"))
+    os.makedirs(workspace, exist_ok=True)
+ 
+    uploaded = st.file_uploader("上传文件", accept_multiple_files=True)
+    if uploaded:
+        for f in uploaded:
+            with open(os.path.join(workspace, f.name), "wb") as out:
+                out.write(f.read())
+        st.success(f"已保存 {len(uploaded)} 个文件")
+ 
+    ws_files = sorted(os.listdir(workspace)) if os.path.exists(workspace) else []
+    for fname in ws_files:
+        fpath = os.path.join(workspace, fname)
+        fsize = os.path.getsize(fpath)
+        label = f"📄 {fname} ({fsize//1024}KB)" if fsize >= 1024 else f"📄 {fname} ({fsize}B)"
+        with open(fpath, "rb") as dl:
+            st.download_button(label, dl.read(), file_name=fname, key=f"dl_{fname}")
+ 
+    st.divider()
+    if st.button("🗑️ 清空对话"):
+        st.session_state.messages = []
+        st.session_state.pop("pending_ctx", None)
+        st.rerun()
+ 
+# ─────────────────────────────────────────
+# Session State
+# ─────────────────────────────────────────
+if "messages" not in st.session_state:
+    st.session_state.messages = []
+ 
+# ─────────────────────────────────────────
+# 渲染历史
+# ─────────────────────────────────────────
+st.title("🦞 Claw Agent")
+st.caption("/list 查看 skills · /skill名 任务 · 或直接输入任务")
+ 
+for msg in st.session_state.messages:
+    with st.chat_message(msg["role"]):
+        if msg["role"] == "user":
+            st.markdown(msg["content"])
+        else:
+            render_assistant(msg)
+ 
+# ─────────────────────────────────────────
+# 输入处理
+# ─────────────────────────────────────────
+user_input = st.chat_input("输入任务…")
+if not user_input:
+    st.stop()
+ 
+if not api_key:
+    st.error("请先填写 API Key")
+    st.stop()
+ 
+client = OpenAI(api_key=api_key, base_url=base_url)
+task   = user_input.strip()
+ 
+# /list
+if task == "/list":
+    lines = "\n".join(f"- `/{k}`: {v}" for k, v in skills_meta.items()) or "（无 skill）"
+    st.session_state.messages.append({"role": "user",      "content": task})
+    st.session_state.messages.append({"role": "assistant", "steps": [], "text": lines})
+    st.rerun()
+ 
+# 解析 /skill-name [任务]
+force_skill = None
+if task.startswith("/"):
+    parts = task.split(None, 1)
+    name  = parts[0][1:]
+    if name in skills_meta:
+        force_skill = name
+        task = parts[1] if len(parts) > 1 else "开始执行"
+    else:
+        st.error(f"未找到 skill: `{name}`")
+        st.stop()
+ 
+# pending ask 续接
+pending_ctx = st.session_state.pop("pending_ctx", None)
+ 
+# 记录并渲染用户消息
+st.session_state.messages.append({"role": "user", "content": user_input})
+with st.chat_message("user"):
+    st.markdown(user_input)
+ 
+# ─────────────────────────────────────────
+# 确定 skill 和执行上下文
+#
+# ★ 核心流程：
+#   有 skill（强制或路由）→ 加载 body → 直接 Executor（跳过 Planner）
+#   无 skill              → Planner 拆解 → Executor
+# ─────────────────────────────────────────
+if pending_ctx:
+    active_skill    = pending_ctx["skill"]
+    exec_history    = pending_ctx["exec_history"]
+    executor_system = pending_ctx["executor_system"]
+    exec_history.append({"role": "user", "content": user_input})
+    has_skill       = bool(active_skill)
+    plan_text       = ""
+else:
+    memory = read_memory(workspace)
+ 
+    if force_skill:
+        active_skill = force_skill
+        skill_body   = load_skill_body(force_skill, skill_root)
+        skill_dir    = os.path.abspath(os.path.join(skill_root, force_skill))
+        has_skill    = True
+    else:
+        active_skill = route_skill(task, skills_meta, client, model_name) or ""
+        skill_body   = load_skill_body(active_skill, skill_root) if active_skill else ""
+        skill_dir    = os.path.abspath(os.path.join(skill_root, active_skill)) if active_skill else ""
+        has_skill    = bool(active_skill)
+ 
+    executor_system = build_system(skill_body, memory, workspace, skill_root, skill_dir)
+    exec_history    = [{"role": "user", "content": task}]
+    plan_text       = ""
+ 
+# ─────────────────────────────────────────
+# 执行
+# ─────────────────────────────────────────
+with st.chat_message("assistant"):
+    plan_display = ""
+    steps        = []
+    final_text   = ""
+    pending_ask  = None
+ 
+    if not pending_ctx:
+        if active_skill:
+            st.markdown(f'<div class="step-skill">🧩 Skill: <b>{active_skill}</b></div>',
+                        unsafe_allow_html=True)
+ 
+        # ── Planner：仅在无 skill 时运行 ──
+        if not has_skill:
+            with st.status("🧠 Planner 拆解中…", expanded=False) as ps:
+                try:
+                    ws_files  = sorted(os.listdir(workspace)) if os.path.exists(workspace) else []
+                    file_list = "\n".join(f"  - {f}" for f in ws_files) or "（空）"
+                    planner_msgs = [
+                        {"role": "system", "content": PLANNER_PROMPT},
+                        {"role": "user", "content":
+                            f"任务：{task}\n\n工作目录文件：\n{file_list}\n\n"
+                            f"历史经验：\n{read_memory(workspace)[:800]}"},
+                    ]
+                    plan_text = call_llm(client, model_name, planner_msgs)
+                    ps.update(label="📋 计划就绪", state="complete", expanded=True)
+                    ps.markdown(plan_text)
+                    plan_display = plan_text
+                    # 把计划注入 executor 第一条消息
+                    exec_history[0]["content"] += f"\n\n【执行计划】\n{plan_text}"
+                except Exception:
+                    ps.update(label="⚠️ Planner 跳过", state="error")
+        # 有 skill：skill body 已经是完整指令，不需要 Planner
+ 
+    # ── Executor ReAct 循环 ──
+    with st.status("🚀 执行中…", expanded=True) as es:
+        try:
+            token_ph = st.empty()
+ 
+            for step_n in range(1, max_steps + 1):
+                es.update(label=f"🔄 第 {step_n} 步…", state="running")
+ 
+                raw = call_llm(
+                    client, model_name,
+                    [{"role": "system", "content": executor_system},
+                     *trim_history(exec_history)],
+                    stream_placeholder=token_ph,
+                )
+                exec_history.append({"role": "assistant", "content": raw})
+ 
+                # 解析 JSON
+                try:
+                    action = json.loads(
+                        re.sub(r'^```(?:json)?\s*|\s*```$', '', raw, flags=re.DOTALL))
+                except Exception:
+                    st.markdown(raw)
+                    final_text = raw
+                    es.update(label="💬 回复", state="complete", expanded=False)
+                    break
+ 
+                atype = action.get("type", "")
+                think = action.get("think", "")
+ 
+                if atype == "bash":
+                    cmd = action.get("cmd", "")
+                    st.markdown(
+                        f'<div class="step-bash">💭 {think}<br><b>$ {cmd}</b></div>',
+                        unsafe_allow_html=True)
+                    ph = st.empty(); ph.caption("⚙️ 执行中…")
+                    obs_raw = run_bash(cmd)
+                    ph.empty()
+                    obs = truncate_obs(obs_raw)
+ 
+                    # 错误痛觉注入
+                    pain = ""
+                    if any(k in obs for k in ["Error", "error", "Traceback", "stderr", "timeout"]):
+                        pain = ("\n\n【⚠️ 执行出错】请分析报错原因并修正重试。"
+                                "若同一问题已重试 2 次，换方案或告知用户。")
+ 
+                    st.markdown(
+                        f'<div class="step-obs">→ {obs[:600]}{"…" if len(obs)>600 else ""}</div>',
+                        unsafe_allow_html=True)
+                    steps.append({"type": "bash", "think": think, "cmd": cmd, "obs": obs})
+                    exec_history.append({"role": "user", "content": f"[stdout]\n{obs}{pain}"})
+ 
+                elif atype == "ask":
+                    q = action.get("question", "")
+                    st.markdown(f'❓ **{q}**')
+                    steps.append({"type": "ask", "question": q})
+                    pending_ask = q
+                    es.update(label="❓ 等待用户", state="complete", expanded=False)
+                    break
+ 
+                elif atype == "done":
+                    summary = action.get("summary", "完成")
+                    st.markdown(f'<div class="done-badge">✅ {summary}</div>',
+                                unsafe_allow_html=True)
+                    steps.append({"type": "done", "summary": summary})
+                    final_text = summary
+                    es.update(label="✅ 完成", state="complete", expanded=False)
+ 
+                    # 反思：让模型决定是否写记忆
+                    try:
+                        ref_ph  = st.empty()
+                        ref_raw = call_llm(
+                            client, model_name,
+                            [{"role": "system", "content": executor_system},
+                             *trim_history(exec_history),
+                             {"role": "user", "content":
+                                 f"任务完成。如有值得记录的经验，用 bash 追加到 "
+                                 f"{workspace}/experience_log.md。"
+                                 "否则回复 {\"type\":\"done\",\"think\":\"无\",\"summary\":\"无新经验\"}"}],
+                            stream_placeholder=ref_ph,
+                        )
+                        try:
+                            ref_act = json.loads(
+                                re.sub(r'^```(?:json)?\s*|\s*```$', '', ref_raw, flags=re.DOTALL))
+                            if ref_act.get("type") == "bash":
+                                run_bash(ref_act["cmd"])
+                                es.write("🧠 经验已写入")
+                        except Exception:
+                            pass
+                    except Exception:
+                        pass
+                    break
+ 
+                else:
+                    st.warning(f"未知 action: `{atype}`")
+                    break
+ 
+            else:
+                es.update(label=f"⚠️ 达到最大步数 {max_steps}", state="error")
+ 
+        except Exception as e:
+            st.error(f"**出错：** `{e}`")
+            final_text = f"[错误] {e}"
+            es.update(label="❌ 出错", state="error")
+ 
+    # 保存历史
+    st.session_state.messages.append({
+        "role": "assistant", "skill": active_skill,
+        "plan": plan_display, "steps": steps, "text": final_text,
+    })
+    if pending_ask:
+        st.session_state["pending_ctx"] = {
+            "skill": active_skill,
+            "exec_history": exec_history,
+            "executor_system": executor_system,
+        }
